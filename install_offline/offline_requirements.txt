@@ -1,0 +1,16 @@
+# HF2026 离线安装依赖清单
+# 用于断网环境下的离线部署
+#
+# 离线安装步骤:
+#   1. 在有网环境执行: pip download -r offline_requirements.txt -d wheels/
+#   2. 将整个 install_offline/ 目录拷贝到目标机器
+#   3. 在目标机器执行: pip install --no-index --find-links=install_offline/wheels/ -r install_offline/offline_requirements.txt
+
+# 仿真平台通信依赖
+redis>=4.5.0
+
+# 配置文件解析
+pyyaml>=6.0
+
+# 数值计算
+numpy>=1.24.0
