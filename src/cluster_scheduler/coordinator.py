@@ -35,7 +35,6 @@ K=2协同核心逻辑 (赛题二硬约束: 2架UAV同时盯防20s才能摧毁):
 """
 
 # TODO: 实现协同调度器
-print("啥意思")
 #
 # class CooperativeCoordinator:
 #     def __init__(self, my_uid: int, k: int = 2):
