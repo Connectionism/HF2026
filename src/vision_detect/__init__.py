@@ -1,10 +1,12 @@
-# -*- coding: utf-8 -*-
-"""
-视觉识别模块 - EMA滤波 + 诱饵判别 + 上报优化
+from .ema_filter import EMATracker, haversine_distance
+from .decoy_classifier import DecoyClassifier
+from .report import ReportOptimizer, make_report_message, parse_report_message
 
-负责人: 成员4
-模块文件:
-  ema_filter.py       EMA滤波 + 线性回归速度估计
-  decoy_classifier.py 诱饵判别(多特征融合)
-  report.py           report_target上报 + RMSE优化
-"""
+__all__ = [
+    'EMATracker',
+    'haversine_distance',
+    'DecoyClassifier',
+    'ReportOptimizer',
+    'make_report_message',
+    'parse_report_message',
+]
