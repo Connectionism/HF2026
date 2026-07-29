@@ -1,0 +1,91 @@
+# ============================================================
+# HF2026 算法参数配置文件
+# 红枫2026无人集群自主协同智能算法挑战赛 - 赛题二: 多机协同识别
+# ============================================================
+# 说明: 所有可调参数集中在此文件管理，便于参数网格搜索和消融实验
+# 负责人: 队长(成员5) 统一管理，各成员维护各自模块参数
+
+# --- 全局参数 ---
+global:
+  scenario: "coop_decoy"            # 赛题名称
+  duration: 600                      # 仿真总时长(秒)
+  tick_hz: 10                        # 平台调用频率(Hz)
+  fleet_size: 3                      # 无人机数量
+  uav_ids: [20001, 20002, 20003]    # 无人机UID列表
+  uav_altitude: 500                  # 固定飞行高度(米)
+
+# --- 搜索参数 (成员2) ---
+search:
+  sector_angle: 120                  # 扇区角度(度), 3机均分360度
+  search_speed: 24                   # 搜索巡航速度(m/s), 范围18-30
+  search_altitude: 300               # 搜索高度(米), 范围150-500
+  spiral_step: 200                   # 螺旋扩张步长(米)
+  coverage_overlap: 0.3              # 航线重叠率
+
+# --- 跟踪参数 (成员2) ---
+tracker:
+  track_radius: 330                  # 跟踪环半径(米), 范围200-400
+  track_speed: 20                    # 跟踪盘旋速度(m/s)
+  slot_spacing: 250                  # K=2站位间距(米), 必须>200m
+  gimbal_fov: 30                     # 云台视场角(度)
+  los_update_rate: 10                # LOS瞄准更新频率(Hz)
+
+# --- 通信参数 (成员1) ---
+communication:
+  max_payload_bytes: 50              # 单条消息最大字节数
+  max_send_rate_hz: 4                # 最大发送频率(Hz)
+  comm_range_m: 1000                 # 通信极限距离(米)
+  inbox_size: 32                     # 收件箱容量
+  comm_period_tick: 8                # 通信周期(帧), 8tick=0.8s
+
+# --- 协同调度参数 (成员3) ---
+coordinator:
+  k_coop: 2                          # 协同盯防阈值(K=2)
+  dwell_threshold_s: 20              # 盯防摧毁阈值(秒)
+  dwell_tolerance_s: 2               # 盯防中断容忍(秒), <=2s不清零
+  summon_timeout_s: 30               # 召唤超时(秒)
+  verify_timeout_s: 8                # 目标验证超时(秒)
+  reassign_delay_s: 5                # 目标重分配延迟(秒)
+
+# --- 状态机参数 (成员3) ---
+state_machine:
+  initial_state: "SEARCH"            # 初始状态
+  verify_frames: 30                  # 验证所需帧数(3s@10Hz)
+  track_confirm_frames: 5            # 跟踪确认帧数
+  release_delay_s: 3                 # 释放延迟(秒)
+
+# --- 视觉检测参数 (成员4) ---
+vision:
+  ema_alpha: 0.3                     # EMA平滑系数, 范围0.2-0.5
+  ema_history: 80                    # EMA历史长度(帧), 8s@10Hz
+  speed_confirm_threshold: 3.0       # 速度确认阈值(m/s), 真目标>此值
+  speed_reject_threshold: 1.0        # 速度拒绝阈值(m/s), 诱饵<此值
+  detection_rate: 0.85               # 检出率
+  position_noise_sigma: 50           # 位置噪声标准差(米)
+  decoy_misid_rate: 0.5              # 诱饵误识别率
+
+# --- 上报参数 (成员4) ---
+report:
+  report_interval_s: 1.0             # 上报间隔(秒)
+  rmse_target_m: 60                  # 目标RMSE(米)
+  rmse_max_m: 120                    # RMSE满分阈值(米)
+
+# --- 评分权重 (参考, 参赛手册 5.3) ---
+scoring:
+  kill_weight: 0.5                   # 摧毁率权重
+  accuracy_weight: 0.3               # 上报精度权重
+  mission_time_weight: 0.2           # 全歼耗时权重
+  full_kill_time_s: 240              # 全歼满分时间(秒)
+  zero_kill_time_s: 420              # 全歼零分时间(秒)
+  penalty_max: 15                    # 惩罚上限(分)
+  proximity_threshold_m: 200         # 飞机过近阈值(米)
+  boundary_limit_m: 500              # 越界阈值(米)
+
+# --- 地图边界 (参赛手册 3) ---
+map:
+  lat_min: 26.9818
+  lat_max: 27.0250
+  lon_min: 124.9800
+  lon_max: 125.0203
+  width_km: 6.6
+  height_km: 4.4
