@@ -166,8 +166,8 @@ class EMATracker:
             while diff > math.pi:
                 diff -= 2 * math.pi
             while diff < -math.pi:
-         diff += 2 * math.pi
-            changes.append(diff)
+              diff += 2 * math.pi
+        changes.append(diff)
         
         if len(changes) < 2:
             return 0.0
