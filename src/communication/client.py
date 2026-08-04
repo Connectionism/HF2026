@@ -1,195 +1,175 @@
 """
-Redis 通信客户端封装
+原生通信客户端 — 对接赛事平台通信 API。
 
-用法:
-    client = CommClient(host="127.0.0.1", port=6379)
-    client.connect()
-    client.subscribe("sim:states")          # 订阅状态频道
-    client.publish("sim:commands", "hello") # 发送消息
+彻底移除 Redis 依赖，改为在 Runner 的 decide() 周期中工作：
+    发送：调用 build_broadcast / build_unicast 校验 payload，
+         再通过 decide() 返回 broadcast() / send_to() 下发
+    接收：调用 parse_inbox 解析 obs.comm_inbox
+
+阶段一 (单无人机)：
+    - 仅 uav_alpha 运行任务，其余两架悬停
+    - 未开发跨机广播、目标共享、召唤队友等逻辑
 """
 
-import json
 import time
-import redis
-from typing import Optional, Callable
+from typing import Optional
+
+from . import config
+from .protocol import decode
 
 
 class CommClient:
     """
-    基于 Redis Pub/Sub 的通信客户端
+    原生通信客户端 (de-Redis 重构版)。
 
-    两个默认频道（跟比赛 SDK 一致）:
-        CMD_CHANNEL   = "sim:commands"   # UAV 发命令给引擎
-        STATE_CHANNEL = "sim:states"     # 引擎广播状态给 UAV
+    用法 (在 decide() 中):
+        client = CommClient(uav_name="uav_alpha")
+
+        # 发消息
+        payload = client.build_broadcast("T:a,27.0,125.0,85")
+        return [broadcast(payload)]
+
+        # 收消息
+        for msg in client.parse_inbox(obs.comm_inbox):
+            print(msg)
     """
 
-    CMD_CHANNEL = "sim:commands"
-    STATE_CHANNEL = "sim:state"
+    # ------------------------------------------------------------------
+    # 构造 / 元信息
+    # ------------------------------------------------------------------
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 6379):
-        self.host = host
-        self.port = port
-        self._redis: Optional[redis.Redis] = None
-        self._pubsub: Optional[redis.client.PubSub] = None
-
-    # ---------- 连接管理 ----------
-
-    def connect(self) -> bool:
-        """连接 Redis，成功返回 True"""
-        try:
-            self._redis = redis.Redis(
-                host=self.host,
-                port=self.port,
-                decode_responses=True,      # 自动把 bytes 转成 str
-                socket_connect_timeout=5,   # 连接超时 5 秒
-                socket_timeout=5,           # 读写超时 5 秒
-            )
-            self._redis.ping()  # 测试连接
-            return True
-        except Exception as e:
-            print(f"[CommClient] Redis 连接失败: {e}")
-            return False
-
-    def disconnect(self):
-        """断开连接"""
-        if self._pubsub:
-            self._pubsub.close()
-            self._pubsub = None
-        if self._redis:
-            self._redis.close()
-            self._redis = None
-
-    def is_connected(self) -> bool:
-        """检查是否已连接"""
-        if not self._redis:
-            return False
-        try:
-            self._redis.ping()
-            return True
-        except:
-            return False
-
-    # ---------- 发布 ----------
-
-    def publish(self, channel: str, message: str):
+    def __init__(self, uav_name: str):
         """
-        向指定频道发布一条消息
-
-        示例:
-            client.publish("sim:commands", "T:a,27.01234,125.03456,85")
-        """
-        if not self._redis:
-            raise RuntimeError("Redis 未连接，先调用 connect()")
-        self._redis.publish(channel, message)
-
-    def publish_json(self, channel: str, data: dict):
-        """发布 JSON 格式的消息（自动序列化）"""
-        self.publish(channel, json.dumps(data, ensure_ascii=False))
-
-    # ---------- 订阅 ----------
-
-    def subscribe(self, channel: str):
-        """订阅一个频道，开始接收消息"""
-        if not self._redis:
-            raise RuntimeError("Redis 未连接，先调用 connect()")
-        self._pubsub = self._redis.pubsub()
-        self._pubsub.subscribe(channel)
-
-    def subscribe_multi(self, channels: list[str]):
-        """同时订阅多个频道"""
-        if not self._redis:
-            raise RuntimeError("Redis 未连接，先调用 connect()")
-        self._pubsub = self._redis.pubsub()
-        self._pubsub.subscribe(*channels)
-
-    # ---------- 接收 ----------
-
-    def get_message(self, timeout: float = 0.1) -> Optional[dict]:
-        """
-        非阻塞获取一条消息
-
         参数:
-            timeout: 等待秒数，默认 0.1 秒。0 表示立即返回
-
-        返回:
-            有消息返回 {'channel': 'xxx', 'data': 'yyy'}
-            没消息返回 None
+            uav_name: 无人机标识，如 "uav_alpha" (不写死)
         """
-        if not self._pubsub:
-            return None
+        if not uav_name or not isinstance(uav_name, str):
+            raise ValueError("uav_name 必须是非空字符串")
 
-        msg = self._pubsub.get_message(timeout=timeout)
+        self._uav_name = uav_name
 
-        if msg and msg.get("type") == "message":
-            return {
-                "channel": msg["channel"],
-                "data": msg["data"],
-            }
-        return None
+        # 流速控制 (4 Hz)
+        self._send_window: list[float] = []
 
-    def get_message_json(self, timeout: float = 0.1) -> Optional[dict]:
-        """获取消息并自动解析 JSON"""
-        msg = self.get_message(timeout=timeout)
-        if msg:
-            try:
-                msg["data"] = json.loads(msg["data"])
-            except json.JSONDecodeError:
-                pass  # 不是 JSON 就保持原样
-        return msg
+        # 统计
+        self._sent_total   = 0
+        self._recv_total   = 0
+        self._dropped_rate = 0
+        self._dropped_size = 0
 
-    def listen(self, callback: Callable[[str], None], stop_check: Optional[Callable[[], bool]] = None):
-        """
-        持续监听消息（阻塞式）
+    # ------------------------------------------------------------------
+    # 属性
+    # ------------------------------------------------------------------
 
-        参数:
-            callback: 收到消息时调用的函数，参数是消息字符串
-            stop_check: 可选，返回 True 时停止监听
+    @property
+    def uav_name(self) -> str:
+        return self._uav_name
 
-        示例:
-            def on_msg(data):
-                print(f"收到: {data}")
-
-            client.listen(on_msg)
-        """
-        if not self._pubsub:
-            raise RuntimeError("未订阅频道，先调用 subscribe()")
-
-        print("[CommClient] 开始监听消息...")
-        try:
-            while True:
-                if stop_check and stop_check():
-                    break
-
-                msg = self.get_message(timeout=0.5)
-                if msg:
-                    callback(msg["data"])
-
-        except KeyboardInterrupt:
-            print("[CommClient] 监听被手动停止")
-
-    # ---------- 高级：带 UID 的命令发送（跟比赛 SDK 对接）----------
-
-    def send_command(self, uid: str, payload: str, channel: str = CMD_CHANNEL):
-        """
-        发送带 UAV 身份标识的命令（跟比赛引擎格式一致）
-
-        格式: {"uid": "uav_0", "payload": "T:a,27.0,125.0,85", "timestamp": 1234567.89}
-        """
-        cmd = {
-            "uid": uid,
-            "payload": payload,
-            "timestamp": time.time(),
+    @property
+    def stats(self) -> dict:
+        """返回通信统计快照 (只读)。"""
+        return {
+            "sent_total":   self._sent_total,
+            "recv_total":   self._recv_total,
+            "dropped_rate": self._dropped_rate,
+            "dropped_size": self._dropped_size,
         }
-        self.publish_json(channel, cmd)
 
-    def recv_state(self, timeout: float = 0.1) -> Optional[dict]:
+    # ------------------------------------------------------------------
+    # 发送
+    # ------------------------------------------------------------------
+
+    def build_broadcast(self, payload: str) -> str:
         """
-        从状态频道接收一条引擎广播的状态（自动解析 JSON）
+        构建广播 payload。
+        校验 → 通过返回原样字符串，失败抛 ValueError。
         """
-        msg = self.get_message(timeout=timeout)
-        if not msg:
-            return None
-        try:
-            return json.loads(msg["data"])
-        except json.JSONDecodeError:
-            return {"raw": msg["data"]}
+        self._validate(payload)
+        self._sent_total += 1
+        return payload
+
+    def build_unicast(self, target_uid: str, payload: str) -> tuple[str, str]:
+        """
+        构建单播 payload。
+        返回 (target_uid, payload)，供 send_to() 使用。
+        """
+        if not target_uid or not isinstance(target_uid, str):
+            raise ValueError("target_uid 必须是非空字符串")
+
+        self._validate(payload)
+        self._sent_total += 1
+        return (target_uid, payload)
+
+    # ------------------------------------------------------------------
+    # 接收
+    # ------------------------------------------------------------------
+
+    def parse_inbox(self, inbox) -> list:
+        """
+        解析 obs.comm_inbox，返回已解码的消息对象列表。
+
+        inbox 是 CommMsg 序列，每条包含:
+            .sender_uid : str
+            .payload    : str
+
+        返回 list[dataclass | None]，未解码项为 None。
+        """
+        results = []
+        for msg in inbox:
+            self._recv_total += 1
+            obj = decode(msg.payload)
+            results.append(obj)
+        return results
+
+    # ------------------------------------------------------------------
+    # 流速控制
+    # ------------------------------------------------------------------
+
+    def can_send(self, now: Optional[float] = None) -> bool:
+        """
+        是否允许发送 (4 Hz 限流)。
+
+        每周期调用一次即可；若不调用，build_broadcast/build_unicast
+        仍会执行但不做限流。
+        """
+        if now is None:
+            now = time.monotonic()
+
+        window_s = 1.0
+        # 驱逐 1 秒前的记录
+        self._send_window = [t for t in self._send_window if now - t < window_s]
+
+        if len(self._send_window) < config.SEND_RATE_HZ:
+            self._send_window.append(now)
+            return True
+
+        self._dropped_rate += 1
+        return False
+
+    # ------------------------------------------------------------------
+    # 内部校验
+    # ------------------------------------------------------------------
+
+    def _validate(self, payload: str) -> None:
+        """校验 payload 合法性，不通过抛 ValueError。"""
+        if not payload or not isinstance(payload, str):
+            raise ValueError("payload 必须是非空字符串")
+
+        byte_len = len(payload.encode("utf-8"))
+        if byte_len > config.PAYLOAD_MAX_BYTES:
+            self._dropped_size += 1
+            raise ValueError(
+                f"payload 超长: {byte_len} > {config.PAYLOAD_MAX_BYTES} 字节"
+            )
+
+    # ------------------------------------------------------------------
+    # 重置 / 清理
+    # ------------------------------------------------------------------
+
+    def reset(self) -> None:
+        """清空流速窗口和统计，用于新一局开始时调用。"""
+        self._send_window.clear()
+        self._sent_total   = 0
+        self._recv_total   = 0
+        self._dropped_rate = 0
+        self._dropped_size = 0
