@@ -7,39 +7,42 @@
     A: — 集结请求 (Assemble)
     C: — 确认应答 (Confirm)
     R: — 解除/取消 (Release)
-    J: — 干扰报告 (Jamming)     ← V1.1.0 新增
-    H: — 心跳存活 (Heartbeat)   ← V1.1.0 新增
+    J: — 干扰报告 (Jamming)
+    H: — 心跳存活 (Heartbeat)
 
-编码方案（简单版）：坐标直接写小数，代码简单，29字节左右
-如需压缩，可用整数偏移版（17字节），两套 API 都提供
+编码方案（简单版）：坐标直接写小数，代码简单，29 字节左右
+如需压缩，可用整数偏移版（17 字节），两套 API 都提供
 """
 
 from dataclasses import dataclass
-from typing import Union, Optional
+from typing import Optional, Union
 
+from . import config
 
-# ========== 常量 ==========
+# ==========================================================================
+# 消息类型常量
+# ==========================================================================
 
-MSG_TYPE_TARGET   = 'T'
-MSG_TYPE_DECOY    = 'D'
-MSG_TYPE_ASSEMBLE = 'A'
-MSG_TYPE_CONFIRM  = 'C'
-MSG_TYPE_RELEASE  = 'R'
-MSG_TYPE_JAMMING  = 'J'
+MSG_TYPE_TARGET    = 'T'
+MSG_TYPE_DECOY     = 'D'
+MSG_TYPE_ASSEMBLE  = 'A'
+MSG_TYPE_CONFIRM   = 'C'
+MSG_TYPE_RELEASE   = 'R'
+MSG_TYPE_JAMMING   = 'J'
 MSG_TYPE_HEARTBEAT = 'H'
 
-MAX_PAYLOAD_BYTES = 50  # 消息最大字节数
+# ==========================================================================
+# 消息数据类
+# ==========================================================================
 
-
-# ========== 消息数据类 ==========
 
 @dataclass(frozen=True)
 class TargetMsg:
     """T: 发现真目标，请求协同"""
-    tid: str          # 目标编号 a~z
-    lat: float        # 纬度
-    lon: float        # 经度
-    conf: float       # 置信度 0.0~1.0
+    tid:  str          # 目标编号 a~z
+    lat:  float        # 纬度
+    lon:  float        # 经度
+    conf: float        # 置信度 0.0~1.0
 
 
 @dataclass(frozen=True)
@@ -52,56 +55,59 @@ class DecoyMsg:
 @dataclass(frozen=True)
 class AssembleMsg:
     """A: 请求队友来这个位置集合"""
-    lat: float
-    lon: float
-    reason: str       # 't'=协同跟踪, 's'=扇区搜索, 'h'=待命
+    lat:    float
+    lon:    float
+    reason: str         # 't'=协同跟踪, 's'=扇区搜索, 'h'=待命
 
 
 @dataclass(frozen=True)
 class ConfirmMsg:
     """C: 收到队友消息，回复确认"""
-    ref_type: str     # 'T', 'D', 'A' — 回应哪种消息
-    ref_id: str       # 目标id 或 坐标摘要
+    ref_type: str       # 'T', 'D', 'A' — 回应哪种消息
+    ref_id:   str       # 目标 id 或坐标摘要
 
 
 @dataclass(frozen=True)
 class ReleaseMsg:
-    """R: 目标已处理/误判，解除盯防"""
-    target: str       # 目标id 或 'A'(取消集结)
+    """R: 目标已处理 / 误判，解除盯防"""
+    target: str         # 目标 id 或 'A' (取消集结)
 
 
 @dataclass(frozen=True)
 class JammingMsg:
-    """J: 通信干扰状态报告（V1.1.0 新增）"""
-    state: str        # 'on'=进入干扰区, 'off'=脱离干扰区
+    """J: 通信干扰状态报告"""
+    state: str          # 'on'=进入干扰区, 'off'=脱离干扰区
 
 
 @dataclass(frozen=True)
 class HeartbeatMsg:
-    """H: 心跳存活广播（V1.1.0 新增）"""
-    status: str       # 'a'=alive, 'd'=destroyed
+    """H: 心跳存活广播"""
+    status: str         # 'a'=alive, 'd'=destroyed
 
 
-MsgType = Union[TargetMsg, DecoyMsg, AssembleMsg, ConfirmMsg, ReleaseMsg,
-                JammingMsg, HeartbeatMsg]
+MsgType = Union[
+    TargetMsg, DecoyMsg, AssembleMsg, ConfirmMsg, ReleaseMsg,
+    JammingMsg, HeartbeatMsg,
+]
 
+# ==========================================================================
+# 编码（简单版：小数坐标）
+# ==========================================================================
 
-# ========== 编码（简单版：小数坐标）==========
 
 def encode(msg: MsgType) -> str:
-    """
-    把消息对象变成字符串，直接用小数坐标（代码最简单）
+    """消息对象 → 字符串（简单版，直接用小数坐标）
 
-    示例：
+    示例:
         encode(TargetMsg('a', 27.01234, 125.03456, 0.85))
         → "T:a,27.01234,125.03456,85"
     """
     if isinstance(msg, TargetMsg):
-        return f"T:{msg.tid},{msg.lat:.5f},{msg.lon:.5f},{int(msg.conf * 100)}"
+        return f"T:{msg.tid},{msg.lat:.{config.COORD_DECIMALS}f},{msg.lon:.{config.COORD_DECIMALS}f},{int(msg.conf * 100)}"
     elif isinstance(msg, DecoyMsg):
-        return f"D:{msg.lat:.5f},{msg.lon:.5f}"
+        return f"D:{msg.lat:.{config.COORD_DECIMALS}f},{msg.lon:.{config.COORD_DECIMALS}f}"
     elif isinstance(msg, AssembleMsg):
-        return f"A:{msg.lat:.5f},{msg.lon:.5f},{msg.reason}"
+        return f"A:{msg.lat:.{config.COORD_DECIMALS}f},{msg.lon:.{config.COORD_DECIMALS}f},{msg.reason}"
     elif isinstance(msg, ConfirmMsg):
         return f"C:{msg.ref_type},{msg.ref_id}"
     elif isinstance(msg, ReleaseMsg):
@@ -111,37 +117,38 @@ def encode(msg: MsgType) -> str:
     elif isinstance(msg, HeartbeatMsg):
         return f"H:{msg.status}"
     else:
-        raise ValueError(f"不认识的消息类型: {type(msg)}")
+        raise ValueError(f"不支持的消息类型: {type(msg)}")
 
 
-# ========== 编码（压缩版：整数偏移）==========
-
-BASE_LAT = 27.0
-BASE_LON = 125.0
-SCALE = 100000  # 0.00001° ≈ 1.1米
+# ==========================================================================
+# 编码（压缩版：整数偏移）
+# ==========================================================================
 
 
 def _lat_to_int(lat: float) -> int:
-    return round((lat - BASE_LAT) * SCALE)
+    """纬度 → 整数偏移"""
+    return round((lat - config.BASE_LAT) * config.COORD_SCALE)
 
 
 def _lon_to_int(lon: float) -> int:
-    return round((lon - BASE_LON) * SCALE)
+    """经度 → 整数偏移"""
+    return round((lon - config.BASE_LON) * config.COORD_SCALE)
 
 
 def _int_to_lat(v: int) -> float:
-    return BASE_LAT + v / SCALE
+    """整数偏移 → 纬度"""
+    return config.BASE_LAT + v / config.COORD_SCALE
 
 
 def _int_to_lon(v: int) -> float:
-    return BASE_LON + v / SCALE
+    """整数偏移 → 经度"""
+    return config.BASE_LON + v / config.COORD_SCALE
 
 
 def encode_compact(msg: MsgType) -> str:
-    """
-    压缩版编码：坐标变成整数偏移（省字节，17字节左右）
+    """消息对象 → 字符串（压缩版，整数偏移，约 17 字节）
 
-    示例：
+    示例:
         encode_compact(TargetMsg('a', 27.01234, 125.03456, 0.85))
         → "T:a,1234,3456,85"
     """
@@ -160,14 +167,16 @@ def encode_compact(msg: MsgType) -> str:
     elif isinstance(msg, HeartbeatMsg):
         return f"H:{msg.status}"
     else:
-        raise ValueError(f"不认识的消息类型: {type(msg)}")
+        raise ValueError(f"不支持的消息类型: {type(msg)}")
 
 
-# ========== 解码 ==========
+# ==========================================================================
+# 解码
+# ==========================================================================
+
 
 def decode(payload: str, compact: bool = False) -> Optional[MsgType]:
-    """
-    把收到的字符串解析成消息对象
+    """字符串 → 消息对象
 
     参数:
         payload: 收到的消息字符串，如 "T:a,27.01234,125.03456,85"
@@ -180,44 +189,34 @@ def decode(payload: str, compact: bool = False) -> Optional[MsgType]:
         return None
 
     msg_type = payload[0]
-    data = payload[2:]  # 跳过 "X:"
+    data = payload[2:]          # 跳过 "X:"
 
     try:
         if msg_type == 'T':
             parts = data.split(',')
             if len(parts) >= 4:
-                tid = parts[0]
-                if compact:
-                    lat = _int_to_lat(int(parts[1]))
-                    lon = _int_to_lon(int(parts[2]))
-                else:
-                    lat = float(parts[1])
-                    lon = float(parts[2])
-                conf = int(parts[3]) / 100.0
-                return TargetMsg(tid=tid, lat=lat, lon=lon, conf=conf)
+                lat = _int_to_lat(int(parts[1])) if compact else float(parts[1])
+                lon = _int_to_lon(int(parts[2])) if compact else float(parts[2])
+                return TargetMsg(
+                    tid=parts[0],
+                    lat=lat,
+                    lon=lon,
+                    conf=int(parts[3]) / 100.0,
+                )
 
         elif msg_type == 'D':
             parts = data.split(',')
             if len(parts) >= 2:
-                if compact:
-                    lat = _int_to_lat(int(parts[0]))
-                    lon = _int_to_lon(int(parts[1]))
-                else:
-                    lat = float(parts[0])
-                    lon = float(parts[1])
+                lat = _int_to_lat(int(parts[0])) if compact else float(parts[0])
+                lon = _int_to_lon(int(parts[1])) if compact else float(parts[1])
                 return DecoyMsg(lat=lat, lon=lon)
 
         elif msg_type == 'A':
             parts = data.split(',')
             if len(parts) >= 3:
-                if compact:
-                    lat = _int_to_lat(int(parts[0]))
-                    lon = _int_to_lon(int(parts[1]))
-                else:
-                    lat = float(parts[0])
-                    lon = float(parts[1])
-                reason = parts[2]
-                return AssembleMsg(lat=lat, lon=lon, reason=reason)
+                lat = _int_to_lat(int(parts[0])) if compact else float(parts[0])
+                lon = _int_to_lon(int(parts[1])) if compact else float(parts[1])
+                return AssembleMsg(lat=lat, lon=lon, reason=parts[2])
 
         elif msg_type == 'C':
             parts = data.split(',')
@@ -240,8 +239,7 @@ def decode(payload: str, compact: bool = False) -> Optional[MsgType]:
 
 
 def decode_to_dict(payload: str, compact: bool = False) -> Optional[dict]:
-    """
-    把消息解析成字典（更灵活，适合直接用在业务代码里）
+    """字符串 → 字典（比 decode 更灵活，适合业务代码直接使用）
 
     示例:
         decode_to_dict("T:a,27.01234,125.03456,85")
@@ -251,31 +249,36 @@ def decode_to_dict(payload: str, compact: bool = False) -> Optional[dict]:
     if msg is None:
         return None
 
+    base = {'type': payload[0]}
+
     if isinstance(msg, TargetMsg):
-        return {'type': 'T', 'tid': msg.tid, 'lat': msg.lat, 'lon': msg.lon, 'conf': msg.conf}
+        return {**base, 'tid': msg.tid, 'lat': msg.lat, 'lon': msg.lon, 'conf': msg.conf}
     elif isinstance(msg, DecoyMsg):
-        return {'type': 'D', 'lat': msg.lat, 'lon': msg.lon}
+        return {**base, 'lat': msg.lat, 'lon': msg.lon}
     elif isinstance(msg, AssembleMsg):
-        return {'type': 'A', 'lat': msg.lat, 'lon': msg.lon, 'reason': msg.reason}
+        return {**base, 'lat': msg.lat, 'lon': msg.lon, 'reason': msg.reason}
     elif isinstance(msg, ConfirmMsg):
-        return {'type': 'C', 'ref_type': msg.ref_type, 'ref_id': msg.ref_id}
+        return {**base, 'ref_type': msg.ref_type, 'ref_id': msg.ref_id}
     elif isinstance(msg, ReleaseMsg):
-        return {'type': 'R', 'target': msg.target}
+        return {**base, 'target': msg.target}
     elif isinstance(msg, JammingMsg):
-        return {'type': 'J', 'state': msg.state}
+        return {**base, 'state': msg.state}
     elif isinstance(msg, HeartbeatMsg):
-        return {'type': 'H', 'status': msg.status}
+        return {**base, 'status': msg.status}
 
     return None
 
 
-# ========== 工具函数 ==========
+# ==========================================================================
+# 工具函数
+# ==========================================================================
+
 
 def check_length(payload: str) -> bool:
-    """检查消息是否超过 50 字节限制，超限返回 False"""
-    return len(payload.encode('utf-8')) <= MAX_PAYLOAD_BYTES
+    """检查消息是否 ≤ 50 字节限制"""
+    return len(payload.encode('utf-8')) <= config.PAYLOAD_MAX_BYTES
 
 
 def get_length(payload: str) -> int:
-    """返回消息的字节长度"""
+    """返回消息的字节长度 (UTF-8)"""
     return len(payload.encode('utf-8'))
