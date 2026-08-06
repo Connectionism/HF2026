@@ -23,8 +23,7 @@
 from .client import CommClient
 from .protocol import MsgType, encode
 
-# 外部适配层 — 对接底层仿真通信通道
-import comm_adapter
+from . import comm_adapter
 
 
 class CommHandle:
