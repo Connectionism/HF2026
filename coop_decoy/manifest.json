@@ -1,0 +1,8 @@
+{
+  "id": "multi_uav_coop_decoy",
+  "name": "赛题二：多目标协同搜索｜队伍名‑阶段1单机基线",
+  "description": "阶段1：单机调试，drone0执行业务，其余无人机悬停",
+  "scenario": "config/scenario.json",
+  "runner_module": "drone_agent",
+  "default_duration": 600.0
+}
