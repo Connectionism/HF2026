@@ -71,7 +71,7 @@ class SectorSearch:
         multi_init_radius: float = 800.0,   # 初始半径（从近处开始扫描）
         multi_radius_step: float = 300.0,   # 每圈半径增量（官方约500m，优化为300m提升覆盖率）
         multi_angle_step: float = 15.0,     # 角度步进（官方约30°，优化为15°提升覆盖率）
-        multi_max_radius: float = 8000.0,   # 最大半径（地图对角线约7900m）
+        multi_max_radius: float = 3500.0,   # 最大半径（地图对角线约7900m）
     ):
         self.uav_name = uav_name
         self.multi_drone = multi_drone

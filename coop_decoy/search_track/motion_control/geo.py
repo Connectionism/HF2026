@@ -3,6 +3,12 @@ src/motion_control/geo.py
 公共地理计算工具（全员依赖）
 包含：距离/方位角/边界裁剪/瞄准线角度/盘旋点生成
 基于 examples/uav_search_track_car/search_track/geometry.py 重构
+
+【阶段二修复】2026-08-09：增加安全内缩边界（Safety Margin）
+- 问题：原 clamp_to_safebox 直接裁剪到精确边界，固定翼因转弯惯性易飞出界
+- 解决方案：参考 coop_distributed.py 的 _SAFEBOX_MARGIN_M = 600.0
+- 将地图边界向内收缩 550 米，生成"安全活动区"
+- 所有坐标裁剪到安全区内，为固定翼留足转弯余量
 """
 import math
 
@@ -12,6 +18,24 @@ EARTH_RADIUS_M = 6_371_000.0
 # 赛题二地图边界（来自参赛手册 §3 / scenario.json 综合）
 LAT_MIN, LAT_MAX = 26.9818, 27.0250
 LON_MIN, LON_MAX = 124.9800, 125.0203
+
+_SAFETY_MARGIN_M = 550.0# 需要至少 500m 的安全余量。这里取 550m 略大于官方的 600m
+
+def _bbox_inset(margin_m: float):
+    """
+    将地图边界向内收缩，生成安全边界
+    【借鉴】coop_distributed.py 第 22-28 行 _bbox_inset() 函数
+    """
+    lat_mid = (LAT_MIN + LAT_MAX) / 2.0
+    # 纬度 1° ≈ 111320 米（固定值）
+    dlat = margin_m / 111320.0
+    # 经度 1° ≈ 111320 * cos(lat) 米（随纬度变化）
+    dlon = margin_m / (111320.0 * math.cos(math.radians(lat_mid)))
+    return (LAT_MIN + dlat, LON_MIN + dlon), (LAT_MAX - dlat, LON_MAX - dlon)
+
+
+# 计算安全边界（比原始地图小一圈，向内收缩 550 米）
+(SAFE_LAT_MIN, SAFE_LON_MIN), (SAFE_LAT_MAX, SAFE_LON_MAX) = _bbox_inset(_SAFETY_MARGIN_M)
 
 # 默认固定翼飞行高度（米）
 DEFAULT_ALTITUDE = 500.0
@@ -39,8 +63,13 @@ def bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 def clamp_to_safebox(lat: float, lon: float) -> tuple[float, float]:
-    """裁剪经纬度到地图边界内，防止越界扣分（参赛手册 §5.3）"""
-    return max(LAT_MIN, min(LAT_MAX, lat)), max(LON_MIN, min(LON_MAX, lon))
+    """
+    裁剪经纬度到【安全活动区域】（内缩 550米），防止越界扣分
+    参考：coop_distributed.py 的 _clamp_to_safebox 使用内缩后的 _SAFEBOX
+    """
+    return (max(SAFE_LAT_MIN, min(SAFE_LAT_MAX, lat)),
+            max(SAFE_LON_MIN, min(SAFE_LON_MAX, lon)))
+
 
 
 def los_angles(
