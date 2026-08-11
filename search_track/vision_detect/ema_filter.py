@@ -1,3 +1,9 @@
+# src/vision_detect/ema_filter.py
+"""
+EMA 滤波器 + 速度估计模块
+用于平滑带噪声的位置观测，并估计目标运动特征
+"""
+
 import math
 from collections import deque
 from typing import Optional, Tuple, List
@@ -6,24 +12,10 @@ from typing import Optional, Tuple, List
 class EMATracker:
     """
     指数移动平均（EMA）滤波器
-    维护一个固定长度的历史队列，用于平滑位置和估计运动特征
-    
-    Attributes:
-        alpha: 平滑系数 (0~1)，越大对最新观测越敏感
-        history: 位置历史队列，用于速度估计
-        max_history: 最大历史长度
-        _value: 当前平滑后的位置 (lat, lon)
-        _initialized: 是否已初始化
+    维护历史队列，用于平滑位置和估计运动特征
     """
     
     def __init__(self, alpha: float = 0.25, max_history: int = 80):
-        """
-        初始化 EMA 滤波器
-        
-        Args:
-            alpha: 平滑系数，推荐范围 0.2~0.4（新规则下诱饵也移动，适当降低alpha增强平滑）
-            max_history: 历史队列最大长度，用于速度估计
-        """
         self.alpha = alpha
         self.max_history = max_history
         self.history: deque = deque(maxlen=max_history)
@@ -31,13 +23,6 @@ class EMATracker:
         self._initialized = False
     
     def append(self, lat: float, lon: float) -> None:
-        """
-        添加一个新的观测值
-        
-        Args:
-            lat: 纬度
-            lon: 经度
-        """
         if not self._initialized:
             self._value = (lat, lon)
             self._initialized = True
@@ -57,11 +42,7 @@ class EMATracker:
     def value(self) -> Optional[Tuple[float, float]]:
         return self._value
     
-    @property
-    def raw_history(self) -> List[Tuple[float, float, float]]:
-        return list(self.history)
-    
-    def speed_mps(self, tick_hz: float = 10.0) -> float:
+    def speed_mps(self) -> float:
         """通过线性回归估计当前速度（米/秒）"""
         if len(self.history) < 4:
             return 0.0
@@ -102,12 +83,7 @@ class EMATracker:
         return math.sqrt(vx * vx + vy * vy)
     
     def speed_variance(self, window: int = 15) -> float:
-        """
-        计算速度方差——用于区分真目标和诱饵
-        
-        真目标（匀速行驶）：速度方差小
-        诱饵（随机游走/噪声驱动）：速度方差大
-        """
+        """计算速度方差——真目标小，诱饵大"""
         if len(self.history) < window + 1:
             return 0.0
         
@@ -139,9 +115,7 @@ class EMATracker:
         return haversine_distance(first[0], first[1], last[0], last[1])
     
     def direction_change_variance(self, window: int = 20) -> float:
-        """
-        计算方向变化方差——真目标运动有规律，诱饵方向变化大
-        """
+        """计算方向变化方差——真目标小，诱饵大"""
         if len(self.history) < window + 1:
             return 0.0
         
@@ -159,7 +133,6 @@ class EMATracker:
         if len(directions) < 3:
             return 0.0
         
-        # 计算方向变化
         changes = []
         for i in range(1, len(directions)):
             diff = directions[i] - directions[i-1]
