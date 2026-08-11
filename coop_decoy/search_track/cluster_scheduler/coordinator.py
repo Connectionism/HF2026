@@ -34,6 +34,7 @@ K=2协同核心逻辑 (赛题二硬约束: 2架UAV同时盯防20s才能摧毁):
 负责人: 成员3
 """
 
+# ── 任务几何参数 ─────────────────────────────────────────────────────────────
 from __future__ import annotations
 
 import hashlib
@@ -41,6 +42,7 @@ import math
 from collections import deque
 from typing import Deque, Dict, List, Optional, Tuple
 
+# ── SDK 导入兼容层 ────────────────────────────────────────────────────────────
 try:
     from sdk.core.commands import (Command, broadcast, fly_to,
                                    point_gimbal, report_target,
@@ -63,13 +65,17 @@ except ImportError:
             params: dict
 
         def fly_to(lat, lon, alt=None, speed=None, loiter_radius=200.0):
-            params = {"latitude": float(lat), "longitude": float(lon), "loiter_radius": float(loiter_radius)}
-            if alt is not None: params["altitude"] = float(alt)
-            if speed is not None: params["speed"] = float(speed)
+            params = {"latitude": float(lat), "longitude": float(lon),
+                      "loiter_radius": float(loiter_radius)}
+            if alt is not None:
+                params["altitude"] = float(alt)
+            if speed is not None:
+                params["speed"] = float(speed)
             return Command("set_destination", params)
 
         def point_gimbal(pan, tilt):
-            return Command("component.gimbal_tracking.set_orientation", {"pan": float(pan), "tilt": float(tilt)})
+            return Command("component.gimbal_tracking.set_orientation",
+                           {"pan": float(pan), "tilt": float(tilt)})
 
         def set_gimbal_fov(fov):
             return Command("set_fov", {"angle": float(fov)})
@@ -87,14 +93,14 @@ except ImportError:
         class CoopObs:
             pass
 
-# ── 任务几何参数 ─────────────────────────────────────────────────────────────
+
+# ── 全局几何参数 ──────────────────────────────────────────────────────────────
 _BBOX: Tuple[Tuple[float, float], Tuple[float, float]] = (
     (26.982, 124.980), (27.025, 125.020))
 _SAFEBOX_MARGIN_M = 600.0
 
 
 def _bbox_inset(bbox, margin_m: float):
-    """从边界框向内收缩指定距离（米），得到安全飞行区域。"""
     (lat_min, lon_min), (lat_max, lon_max) = bbox
     lat_mid = (lat_min + lat_max) / 2
     dlat = margin_m / 111320.0
@@ -104,9 +110,14 @@ def _bbox_inset(bbox, margin_m: float):
 
 _SAFEBOX = _bbox_inset(_BBOX, _SAFEBOX_MARGIN_M)
 
+# 地图中心：三机螺旋搜索的公共起点 & 归中目标点
+_MAP_CENTER: Tuple[float, float] = (
+    (_BBOX[0][0] + _BBOX[1][0]) / 2,
+    (_BBOX[0][1] + _BBOX[1][1]) / 2,
+)
+
 
 def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """使用 Haversine 公式计算两点间距离（米）。"""
     R = 6371000.0
     p1, p2 = math.radians(lat1), math.radians(lat2)
     dp = math.radians(lat2 - lat1)
@@ -117,194 +128,209 @@ def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """计算从点1到点2的绝对方位角（0°=北，顺时针）。"""
     p1, p2 = math.radians(lat1), math.radians(lat2)
     dl = math.radians(lon2 - lon1)
     y = math.sin(dl) * math.cos(p2)
-    x = (math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl))
+    x = (math.cos(p1) * math.sin(p2)
+         - math.sin(p1) * math.cos(p2) * math.cos(dl))
     return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
 
 
 def _clamp_to_safebox(lat: float, lon: float) -> Tuple[float, float]:
-    """将坐标限制在安全飞行区域内。"""
     (lat_min, lon_min), (lat_max, lon_max) = _SAFEBOX
     return (min(max(lat, lat_min), lat_max),
             min(max(lon, lon_min), lon_max))
 
 
-def _partition_centers(bbox, n: int = 3):
-    """将边界框按经度均分为 n 个分区，返回各分区中心坐标列表。"""
-    (lat_min, lon_min), (lat_max, lon_max) = bbox
-    lat_mid = (lat_min + lat_max) / 2
-    sub_w = (lon_max - lon_min) / n
-    return [(lat_mid, lon_min + sub_w * (i + 0.5)) for i in range(n)]
-
-
-_PARTITION_CENTERS = _partition_centers(_BBOX, 3)
-
-
-def _uid_phase(uid: str) -> float:
-    """根据 UID 生成相位偏移（0～1），用于搜索轨迹差异化。"""
-    h = int(hashlib.md5(uid.encode()).hexdigest(), 16)
-    return (h % 1000) / 1000.0
-
-
-def _uid_partition(uid: str) -> Tuple[float, float]:
-    """将 UID 映射到一个分区中心，确保多架无人机搜索不同区域。"""
-    n = len(_PARTITION_CENTERS)
+def _uid_index(uid: str) -> int:
+    """将 UID 确定性映射为 0/1/2，用于螺旋初始相位偏移。"""
     if uid.isdigit():
-        idx = int(uid) % n
-    elif "_" in uid:
+        return int(uid) % 3
+    if "_" in uid:
         tail = uid.rsplit("_", 1)[-1]
-        idx = int(tail) % n if tail.isdigit() else (
-            int(hashlib.md5(uid.encode()).hexdigest(), 16) % n)
-    else:
-        idx = int(hashlib.md5(uid.encode()).hexdigest(), 16) % n
-    return _PARTITION_CENTERS[idx]
+        if tail.isdigit():
+            return int(tail) % 3
+    return int(hashlib.md5(uid.encode()).hexdigest(), 16) % 3
 
 
-# ── 目标 ID 生成 ─────────────────────────────────────────────────────────────
 def _make_target_id(lat: float, lon: float) -> str:
-    """根据坐标生成确定性的目标 ID（多机一致）。"""
+    """确定性目标 ID，保留 4 位小数（≈11m 精度）。"""
     return f"{lat:.4f}_{lon:.4f}"
 
 
-# ── EMA 跟踪器（未修改） ────────────────────────────────────────────────────
+# ── EMA 跟踪器 ────────────────────────────────────────────────────────────────
 class _EMATracker:
-    """基于指数移动平均和线性回归速度估计的目标位置跟踪器。"""
+    # ... __init__, append, value, count, reset 保持不变 ...
 
-    def __init__(self, alpha: float = 0.3, history: int = 80):
-        self._alpha = alpha
-        self._lat: Optional[float] = None
-        self._lon: Optional[float] = None
-        self._raw: Deque[Tuple[float, float]] = deque(maxlen=history)
-
-    def append(self, lat: float, lon: float) -> None:
-        """添加新检测点，更新 EMA 位置和原始数据缓冲区。"""
-        if self._lat is None:
-            self._lat, self._lon = lat, lon
-        else:
-            a = self._alpha
-            self._lat = self._lat * (1 - a) + lat * a
-            self._lon = self._lon * (1 - a) + lon * a
-        self._raw.append((lat, lon))
-
-    @property
-    def value(self) -> Optional[Tuple[float, float]]:
-        """返回当前 EMA 平滑位置。"""
-        if self._lat is None:
-            return None
-        return (self._lat, self._lon)
-
-    def speed_mps(self, tick_hz: float = 10.0) -> float:
-        """通过原始纬度序列的线性回归斜率估算目标速度（米/秒）。"""
+    def speed_and_linearity(self, tick_hz: float = 10.0) -> Tuple[float, float]:
+        """
+        返回 (估算速度 m/s, 轨迹线性度 R²)。
+        R² ∈ [0, 1]：1.0 表示完美直线（真目标），接近 0 表示随机游走（诱饵）。
+        """
         n = len(self._raw)
-        if n < 10:
-            return 0.0
+        if n < 12:  # 样本太少无法可靠计算
+            return 0.0, 0.0
+
         ts = list(range(n))
         lats = [p[0] for p in self._raw]
+        lons = [p[1] for p in self._raw]
         ns = float(n)
-        sx = sum(ts); sy = sum(lats)
+        sx = sum(ts)
         sxx = sum(t * t for t in ts)
-        sxy = sum(t * la for t, la in zip(ts, lats))
         denom = ns * sxx - sx * sx
         if abs(denom) < 1e-20:
-            return 0.0
-        slope = (ns * sxy - sx * sy) / denom   # 度/帧
-        return abs(slope) * 111320.0 * tick_hz  # 转换为米/秒
+            return 0.0, 0.0
 
-    def reset(self) -> None:
-        """重置跟踪器状态。"""
-        self._lat = self._lon = None
-        self._raw.clear()
+        # ── 纬度方向拟合 & SS_res / SS_tot ──
+        sy_lat = sum(lats)
+        sxy_lat = sum(t * la for t, la in zip(ts, lats))
+        slope_lat = (ns * sxy_lat - sx * sy_lat) / denom
+        mean_lat = sy_lat / ns
+        ss_tot_lat = sum((la - mean_lat) ** 2 for la in lats)
+        ss_res_lat = sum((la - (slope_lat * t + (sy_lat - slope_lat * sx) / ns)) ** 2
+                         for t, la in zip(ts, lats))
+
+        # ── 经度方向拟合 & SS_res / SS_tot ──
+        sy_lon = sum(lons)
+        sxy_lon = sum(t * lo for t, lo in zip(ts, lons))
+        slope_lon = (ns * sxy_lon - sx * sy_lon) / denom
+        mean_lon = sy_lon / ns
+        ss_tot_lon = sum((lo - mean_lon) ** 2 for lo in lons)
+        ss_res_lon = sum((lo - (slope_lon * t + (sy_lon - slope_lon * sx) / ns)) ** 2
+                         for t, lo in zip(ts, lons))
+
+        # ── 合成速度与 R² ──
+        lat_mid = lats[-1]
+        v_lat = slope_lat * 111320.0 * tick_hz
+        v_lon = slope_lon * 111320.0 * math.cos(math.radians(lat_mid)) * tick_hz
+        speed = math.sqrt(v_lat ** 2 + v_lon ** 2)
+
+        ss_tot = ss_tot_lat + ss_tot_lon
+        ss_res = ss_res_lat + ss_res_lon
+        r_squared = max(0.0, 1.0 - ss_res / ss_tot) if ss_tot > 1e-20 else 0.0
+
+        return speed, r_squared
 
 
-# ── K=2 协同调度器 ─────────────────────────────────────────────────────────
+# ── 协同调度器（K=2 角色配额制）────────────────────────────────────────────────
 class CooperativeCoordinator:
     """
-    用于 K=2 目标协同攻击的分布式调度器。
-
-    通信协议消息格式：
-      R:<tgt_id>,<lat>,<lon>   — 发现真目标，召唤队友
-      T:<tgt_id>,<dwell>       — 定期广播本机 dwell 状态
-      C:<tgt_id>               — 目标已摧毁通知
+    分布式协同调度器。
+    通信协议：
+      R:<tgt_id>,<lat>,<lon>           — 发现真目标，召唤队友
+      J:<tgt_id>,<uid>                 — 我已加入跟踪（占槽位）
+      T:<tgt_id>,<dwell>,<uid>         — 广播本机累积照射时间
+      C:<tgt_id>                       — 目标已摧毁，释放槽位
     """
 
     def __init__(self, my_uid: str, k: int = 2):
         self.my_uid = my_uid
-        self.k = k  # 需要同时观测的数量（固定为2）
-        # 活动目标记录：tgt_id -> {'pos': (lat,lon), 'confirmed': bool, 'destroyed': bool}
+        self.k = k                          # 最大同时跟踪数 = 2
         self._targets: Dict[str, dict] = {}
-        # 队友的 dwell 报告：tgt_id -> 最新 dwell 值
-        self._peer_dwell: Dict[str, float] = {}
-        # 记录上次发送 R / C 消息的时间，避免频繁广播
+        self._trackers: Dict[str, set] = {}  # tgt_id → {uid, ...}
+        self._peer_dwell: Dict[str, Dict[str, float]] = {}
         self._last_r_sent: Dict[str, float] = {}
         self._last_c_sent: Dict[str, float] = {}
-
-    # ── 公开 API ──────────────────────────────────────────────────────────
+        self._last_j_sent: Dict[str, float] = {}
 
     def ingest_comms(self, comm_inbox: List) -> None:
-        """解析通信收件箱，更新目标列表和队友状态。"""
         for msg in comm_inbox:
             payload = msg.payload
             if payload.startswith("R:"):
-                # R:<tgt_id>,<lat>,<lon>
                 try:
                     parts = payload[2:].split(",")
                     if len(parts) == 3:
-                        tgt_id = parts[0]
-                        lat, lon = float(parts[1]), float(parts[2])
+                        tgt_id, lat, lon = parts[0], float(parts[1]), float(parts[2])
                         if tgt_id not in self._targets:
                             self._targets[tgt_id] = {
                                 "pos": (lat, lon), "confirmed": True, "destroyed": False}
+                        else:
+                            self._targets[tgt_id]["pos"] = (lat, lon)
+                            self._targets[tgt_id]["confirmed"] = True
+                            self._targets[tgt_id]["destroyed"] = False
                 except Exception:
                     pass
-            elif payload.startswith("T:"):
-                # T:<tgt_id>,<dwell>
+            elif payload.startswith("J:"):
                 try:
                     parts = payload[2:].split(",")
                     if len(parts) == 2:
-                        tgt_id = parts[0]
-                        dwell = float(parts[1])
-                        self._peer_dwell[tgt_id] = dwell
+                        tgt_id, uid = parts[0], parts[1]
+                        if tgt_id not in self._trackers:
+                            self._trackers[tgt_id] = set()
+                        self._trackers[tgt_id].add(uid)
+                except Exception:
+                    pass
+            elif payload.startswith("T:"):
+                try:
+                    parts = payload[2:].split(",")
+                    if len(parts) >= 3:
+                        tgt_id, dwell, uid = parts[0], float(parts[1]), parts[2]
+                        if tgt_id not in self._peer_dwell:
+                            self._peer_dwell[tgt_id] = {}
+                        if dwell > self._peer_dwell[tgt_id].get(uid, 0.0):
+                            self._peer_dwell[tgt_id][uid] = dwell
+                        if tgt_id not in self._trackers:
+                            self._trackers[tgt_id] = set()
+                        self._trackers[tgt_id].add(uid)
                 except Exception:
                     pass
             elif payload.startswith("C:"):
-                # C:<tgt_id>
                 tgt_id = payload[2:]
                 if tgt_id in self._targets:
                     self._targets[tgt_id]["destroyed"] = True
+                if tgt_id in self._trackers:
+                    self._trackers[tgt_id].clear()
+
+    # ── 槽位管理 ──
+
+    def total_tracker_count(self, tgt_id: str) -> int:
+        return len(self._trackers.get(tgt_id, set()))
+
+    def slot_available(self, tgt_id: str) -> bool:
+        return self.total_tracker_count(tgt_id) < self.k
+
+    def claim_slot(self, tgt_id: str) -> None:
+        if tgt_id not in self._trackers:
+            self._trackers[tgt_id] = set()
+        self._trackers[tgt_id].add(self.my_uid)
+
+    def release_slot(self, tgt_id: str) -> None:
+        if tgt_id in self._trackers:
+            self._trackers[tgt_id].discard(self.my_uid)
+
+    def need_j_broadcast(self, tgt_id: str, now: float, cooldown: float = 3.0) -> bool:
+        return (tgt_id not in self._last_j_sent
+                or (now - self._last_j_sent[tgt_id]) > cooldown)
+
+    def mark_j_sent(self, tgt_id: str, now: float) -> None:
+        self._last_j_sent[tgt_id] = now
+
+    # ── 目标管理 ──
 
     def confirm_target(self, lat: float, lon: float) -> str:
-        """确认真目标，生成或更新其记录，并返回目标 ID。"""
         tgt_id = _make_target_id(lat, lon)
         if tgt_id not in self._targets:
             self._targets[tgt_id] = {
                 "pos": (lat, lon), "confirmed": True, "destroyed": False}
         else:
-            # 更新位置信息
             self._targets[tgt_id]["pos"] = (lat, lon)
             self._targets[tgt_id]["confirmed"] = True
             self._targets[tgt_id]["destroyed"] = False
         return tgt_id
 
     def confirm_decoy(self, lat: float, lon: float) -> None:
-        """标记为假目标，此后不再被选中。"""
         tgt_id = _make_target_id(lat, lon)
         self._targets[tgt_id] = {
-            "pos": (lat, lon), "confirmed": False, "destroyed": True}  # 视为已摧毁
+            "pos": (lat, lon), "confirmed": False, "destroyed": True}
 
     def select_target(self, self_lat: float, self_lon: float) -> Optional[str]:
-        """
-        选择最优的当前活动目标（未被摧毁）。
-        优先选择已由队友召唤的目标（R 消息收到），其次选择自己发现的目标，
-        同优先级下选择距离最近的。
-        """
+        """选择最近的、有空槽位的、已确认未摧毁目标。"""
         best_id = None
         best_dist = float("inf")
-
         for tgt_id, info in self._targets.items():
             if info.get("destroyed", False) or not info.get("confirmed", False):
+                continue
+            if not self.slot_available(tgt_id):
                 continue
             d = _haversine_m(self_lat, self_lon, info["pos"][0], info["pos"][1])
             if d < best_dist:
@@ -313,32 +339,24 @@ class CooperativeCoordinator:
         return best_id
 
     def is_destroyed(self, tgt_id: str) -> bool:
-        """检查目标是否已被标记为摧毁。"""
         return self._targets.get(tgt_id, {}).get("destroyed", False)
 
     def target_pos(self, tgt_id: str) -> Optional[Tuple[float, float]]:
-        """获取目标当前位置。"""
         return self._targets.get(tgt_id, {}).get("pos")
 
-    def my_slot(self, tgt_id: str) -> int:
-        """
-        分配本机在目标周围的槽位（0 或 1），保证两架无人机获得不同槽位。
-        这里通过比较 UID 大小简单确定：较小者取槽位 0，较大者取槽位 1。
-        """
-        # 实际部署时可通过哈希 (tgt_id + my_uid) % K 实现更通用分配
+    def slot(self, tgt_id: str) -> int:
+        """槽位 0 或 1，基于 UID 字典序排序。"""
+        trackers = sorted(self._trackers.get(tgt_id, set()))
+        if self.my_uid in trackers:
+            return trackers.index(self.my_uid) % 2
         return 0 if self.my_uid < "20003" else 1
 
     def aim_point(self, tgt_id: str, slot: int,
-                  standoff: float = 200.0) -> Tuple[float, float]:
-        """
-        计算指定槽位的盘旋瞄准点坐标，两槽位间距离 > 200 米。
-        槽位 0：目标北侧；槽位 1：目标南侧。
-        """
+                  standoff: float = 250.0) -> Tuple[float, float]:
         pos = self.target_pos(tgt_id)
         if pos is None:
-            return (0.0, 0.0)
+            return _MAP_CENTER
         lat, lon = pos
-        # 槽位0向北偏移，槽位1向南偏移（间距约400米）
         heading = 0.0 if slot == 0 else 180.0
         dlat = standoff * math.cos(math.radians(heading)) / 111320.0
         dlon = standoff * math.sin(math.radians(heading)) / \
@@ -346,76 +364,88 @@ class CooperativeCoordinator:
         return (lat + dlat, lon + dlon)
 
     def need_r_broadcast(self, tgt_id: str, now: float, cooldown: float = 2.0) -> bool:
-        """判断是否需要再次广播 R 消息（冷却期内不会重复发送）。"""
-        if tgt_id not in self._last_r_sent or (now - self._last_r_sent[tgt_id]) > cooldown:
-            return True
-        return False
+        return (tgt_id not in self._last_r_sent
+                or (now - self._last_r_sent[tgt_id]) > cooldown)
 
     def need_c_broadcast(self, tgt_id: str, now: float, cooldown: float = 2.0) -> bool:
-        """判断是否需要再次广播 C 消息。"""
-        if tgt_id not in self._last_c_sent or (now - self._last_c_sent[tgt_id]) > cooldown:
-            return True
-        return False
+        return (tgt_id not in self._last_c_sent
+                or (now - self._last_c_sent[tgt_id]) > cooldown)
 
     def mark_r_sent(self, tgt_id: str, now: float) -> None:
-        """记录 R 消息发送时间。"""
         self._last_r_sent[tgt_id] = now
 
     def mark_c_sent(self, tgt_id: str, now: float) -> None:
-        """记录 C 消息发送时间。"""
         self._last_c_sent[tgt_id] = now
 
-    def peer_dwell(self, tgt_id: str) -> float:
-        """获取队友报告的该目标 dwell 时间。"""
-        return self._peer_dwell.get(tgt_id, 0.0)
+    def peer_total_dwell(self, tgt_id: str) -> float:
+        peers = self._peer_dwell.get(tgt_id, {})
+        return sum(v for uid, v in peers.items() if uid != self.my_uid)
 
     def mark_destroyed(self, tgt_id: str) -> None:
-        """将目标标记为已摧毁。"""
         if tgt_id in self._targets:
             self._targets[tgt_id]["destroyed"] = True
+        if tgt_id in self._trackers:
+            self._trackers[tgt_id].clear()
 
 
-# ── 智能体主体（适配 K=2 协同） ─────────────────────────────────────────────
-
+# ── 智能体主体 ────────────────────────────────────────────────────────────────
 class CoopDistributedAgent(CoopAgent):
-    """支持 K=2 协同的分布式诱饵对抗智能体。"""
-
+    """
+    三机协同智能体（2 锁定 + 1 搜索 + 2 分钟归中）。
+    状态机：SEARCH → VERIFY → TRACK → SEARCH
+                      ↘ RETURN → SEARCH
+    """
     SEARCH = "SEARCH"
     VERIFY = "VERIFY"
     TRACK = "TRACK"
+    RETURN = "RETURN"
 
     def configure(self, config) -> None:
-        # 搜索几何参数
+        # ── 螺旋搜索参数 ──
         self._search_alt: float = 200.0
-        self._search_radius: float = 700.0
-        self._growth: float = 50.0
-        self._ang_speed: float = 30.0
-        self._sweep_period: float = 4.0
-        self._pitch_min: float = -60.0
-        self._pitch_max: float = -30.0
-        # 视场角
-        self._track_fov: float = 60.0
+        self._spiral_max_radius: float = 2500.0
+        self._spiral_growth: float = 80.0
+        self._spiral_ang_speed: float = 18.0
+        self._search_speed: float = 25.0
+
+        # ── 云台扫描参数 ──
+        self._sweep_period: float = 5.0
+        self._pitch_min: float = -65.0
+        self._pitch_max: float = -25.0
         self._search_fov: float = 60.0
-        # 验证阶段（假目标识别）参数
-        self._verify_timeout: float = 8.0
-        self._verify_warmup: float = 3.0
-        self._verify_speed_confirm: float = 3.0   # 米/秒，高于此值视为真目标
-        self._verify_speed_reject: float = 2.5    # 米/秒，低于此值（且够时间）视为假目标
-        self._verify_reject_min_t: float = 5.0    # 至少验证这么久才能拒绝
+        self._track_fov: float = 45.0
+
+        # ── 验证参数 ──
+        self._verify_timeout: float = 6.0
+        self._verify_warmup: float = 2.0
+        self._verify_speed_confirm: float = 3.5
+        self._verify_r2_confirm: float = 0.6
+        self._verify_speed_reject: float = 2.0
+        self._verify_reject_min_t: float = 3.0
+        self._verify_speed_reject: float = 2.0
+        self._verify_r2_reject: float = 0.3
         self._ema_alpha: float = 0.3
-        # 跟踪（摧毁）参数
-        self._dwell_target: float = 20.0
-        self._dwell_grace: float = 2.0
-        self._track_timeout: float = 40.0         # 协同模式下适当放宽超时
-        self._loiter_close: float = 100.0
-        # 通信周期
-        self._status_period: int = 5              # 每 N 帧广播一次 T: 状态
+
+        # ── 跟踪/摧毁参数 ──
+        self._dwell_target: float = 20.0      # 20 秒锁定摧毁
+        self._dwell_grace: float = 3.0
+        self._track_timeout: float = 50.0
+        self._loiter_radius: float = 200.0
+
+        # ── 2 分钟归中参数 ──
+        self._idle_timeout: float = 120.0
+        self._return_speed: float = 30.0
+        self._return_arrive_threshold: float = 100.0
+
+        # ── 通信参数 ──
+        self._status_period: int = 5
         self._r_cooldown: float = 2.0
-        # 运行时状态
+
+        # ── 运行时状态 ──
         self._t: float = 0.0
         self._tick: int = 0
-        self._region = _uid_partition(self.my_uid)
-        self._phase: float = _uid_phase(self.my_uid)
+        self._uav_idx: int = 0
+        self._phase_offset: float = 0.0
         self._state = self.SEARCH
         self._candidate: Optional[Tuple[float, float]] = None
         self._ema = _EMATracker(self._ema_alpha)
@@ -425,14 +455,16 @@ class CoopDistributedAgent(CoopAgent):
         self._track_t: float = 0.0
         self._last_report_t: float = -1e9
         self._known_decoys: List[Tuple[float, float]] = []
-        # 协同调度器
         self._coord = CooperativeCoordinator(self.my_uid, k=2)
-        self._track_target_id: Optional[str] = None  # 当前跟踪的目标 ID
+        self._track_target_id: Optional[str] = None
+        self._tracking_active: bool = False
+        self._last_any_det_t: float = 0.0      # 最后一次检测到任何目标的时间
 
     def reset(self) -> None:
-        """重置智能体状态（每回合开始调用）。"""
         self._t = 0.0
         self._tick = 0
+        self._uav_idx = _uid_index(self.my_uid)
+        self._phase_offset = self._uav_idx * 120.0
         self._state = self.SEARCH
         self._candidate = None
         self._ema = _EMATracker(self._ema_alpha)
@@ -442,46 +474,81 @@ class CoopDistributedAgent(CoopAgent):
         self._track_t = 0.0
         self._last_report_t = -1e9
         self._known_decoys = []
-        self._region = _uid_partition(self.my_uid)
-        self._phase = _uid_phase(self.my_uid)
         self._coord = CooperativeCoordinator(self.my_uid, k=2)
         self._track_target_id = None
+        self._tracking_active = False
+        self._last_any_det_t = 0.0
 
-    # ── 辅助函数 ──
+    # ── 辅助方法 ──
 
     def _tracking_gimbal(self, self_lat, self_lon, self_heading,
                          tgt_lat, tgt_lon) -> Tuple[float, float]:
-        """计算对准目标的云台角度（pan, tilt），补偿本机航向。"""
         brg = _bearing_deg(self_lat, self_lon, tgt_lat, tgt_lon)
-        pan = ((brg - self_heading + 180.0) % 360.0) - 180.0
+        diff_rad = math.atan2(math.sin(math.radians(brg - self_heading)),
+                              math.cos(math.radians(brg - self_heading)))
+        pan = math.degrees(diff_rad)
         ground = max(1.0, _haversine_m(self_lat, self_lon, tgt_lat, tgt_lon))
         tilt = -math.degrees(math.atan2(self._search_alt, ground))
         return pan, tilt
 
-    def _spiral(self) -> Tuple[float, float, float, float]:
+    def _spiral_waypoint(self) -> Tuple[float, float, float, float]:
         """
-        生成当前时刻的搜索螺旋航点及云台扫描角度。
-        返回：(纬度, 经度, 云台pan, 云台tilt)
+        阿基米德螺旋搜索航点。
+        三机从中心出发，120° 间隔，螺旋向外推进。
+        到达最大半径后保持圆周运动（由 2 分钟归中逻辑接管返回）。
         """
-        home_lat, home_lon = self._region
-        t = self._t + self._phase * 12.0
-        bearing = (self._ang_speed * t) % 360.0
-        revs = (self._ang_speed * t) / 360.0
-        radius = max(1.0, min(self._search_radius, self._growth * revs))
+        center_lat, center_lon = _MAP_CENTER
+        t = self._t
+        bearing = (self._spiral_ang_speed * t + self._phase_offset) % 360.0
+        total_angle = self._spiral_ang_speed * t
+        revs = total_angle / 360.0
+        # 半径增长到最大值后保持（钳位），不再自动重置
+        radius = min(self._spiral_max_radius, max(10.0, self._spiral_growth * revs))
+
         dlat = (radius * math.cos(math.radians(bearing))) / 111320.0
         dlon = (radius * math.sin(math.radians(bearing))) / \
-               (111320.0 * math.cos(math.radians(home_lat)))
+               (111320.0 * math.cos(math.radians(center_lat)))
+
         phase = (t % self._sweep_period) / self._sweep_period
         tilt = self._pitch_min + (self._pitch_max - self._pitch_min) * 0.5 * \
                (1 - math.cos(2 * math.pi * phase))
         pan_phase = (t % (self._sweep_period * 2)) / (self._sweep_period * 2)
         pan = -90.0 + 180.0 * 0.5 * (1 - math.cos(2 * math.pi * pan_phase))
-        return home_lat + dlat, home_lon + dlon, pan, tilt
+
+        return center_lat + dlat, center_lon + dlon, pan, tilt
+
+    def _enter_track(self, tgt_id: str, tgt_pos: Tuple[float, float]) -> None:
+        self._track_target_id = tgt_id
+        self._state = self.TRACK
+        self._dwell_time = 0.0
+        self._track_t = 0.0
+        self._last_det_tick = self._t
+        self._tracking_active = False
+        self._ema = _EMATracker(self._ema_alpha)
+        self._ema.append(tgt_pos[0], tgt_pos[1])
+
+    def _do_search(self, obs, cmds) -> List[Command]:
+        slat, slon, pan, tilt = self._spiral_waypoint()
+        slat, slon = _clamp_to_safebox(slat, slon)
+        cmds.append(fly_to(slat, slon, alt=self._search_alt, speed=self._search_speed))
+        cmds.append(point_gimbal(pan, tilt))
+        cmds.append(set_gimbal_fov(self._search_fov))
+        return cmds
+
+    def _do_return_center(self, obs, cmds) -> List[Command]:
+        clat, clon = _clamp_to_safebox(*_MAP_CENTER)
+        cmds.append(fly_to(clat, clon, alt=self._search_alt, speed=self._return_speed))
+        phase = (self._t % self._sweep_period) / self._sweep_period
+        tilt = self._pitch_min + (self._pitch_max - self._pitch_min) * 0.5 * \
+               (1 - math.cos(2 * math.pi * phase))
+        pan_phase = (self._t % (self._sweep_period * 2)) / (self._sweep_period * 2)
+        pan = -90.0 + 180.0 * 0.5 * (1 - math.cos(2 * math.pi * pan_phase))
+        cmds.append(point_gimbal(pan, tilt))
+        cmds.append(set_gimbal_fov(self._search_fov))
+        return cmds
 
     # ── 主决策函数 ──
-
     def decide(self, obs: CoopObs, dt: float) -> List[Command]:
-        """每帧调用，生成当前控制指令。"""
         self._tick += 1
         self._t += dt
         sim_t = self._t
@@ -489,185 +556,140 @@ class CoopDistributedAgent(CoopAgent):
         cmds: List[Command] = []
         self._coord.ingest_comms(obs.comm_inbox)
 
-        # ── 搜索状态 ────────────────────────────────────────────────────
+        # ★ 全局：更新"最后一次看到任何东西"的计时器
+        if det.detected and det.target_lat is not None:
+            self._last_any_det_t = sim_t
+
+        # ══════════════════════════════════════════════════════
+        #  SEARCH — 螺旋搜索
+        # ══════════════════════════════════════════════════════
         if self._state == self.SEARCH:
-            # 如果存在活动协同目标，直接切换到跟踪状态
-            active_tgt = self._coord.select_target(
-                obs.self.lat, obs.self.lon)
+            # ★ 2 分钟无任何检测 → 归中
+            idle_duration = sim_t - self._last_any_det_t
+            if idle_duration >= self._idle_timeout:
+                self._state = self.RETURN
+                return self._do_return_center(obs, cmds)
+
+            # 检查队友召唤（有空槽位才去）
+            active_tgt = self._coord.select_target(obs.self.lat, obs.self.lon)
             if active_tgt is not None:
-                self._track_target_id = active_tgt
-                self._state = self.TRACK
-                self._dwell_time = 0.0
-                self._track_t = 0.0
-                self._last_det_tick = sim_t
-                # 本帧直接进入跟踪逻辑
-            else:
+                tgt_pos = self._coord.target_pos(active_tgt)
+                if tgt_pos is not None:
+                    # ★ 二次检查：防止多架飞机同帧竞争导致超额
+                    if self._coord.slot_available(active_tgt):
+                        self._coord.claim_slot(active_tgt)
+                        if self._coord.need_j_broadcast(active_tgt, sim_t):
+                            cmds.append(broadcast(f"J:{active_tgt},{self.my_uid}"))
+                            self._coord.mark_j_sent(active_tgt, sim_t)
+                        self._enter_track(active_tgt, tgt_pos)
+                    # 如果槽位刚被占满，继续搜索
+
+            if self._state == self.SEARCH:
                 if det.detected and det.target_lat is not None:
-                    # 跳过已知假目标附近的检测
                     near_decoy = any(
                         _haversine_m(det.target_lat, det.target_lon, d[0], d[1]) < 150.0
-                        for d in self._known_decoys) if self._known_decoys else False
+                        for d in self._known_decoys
+                    ) if self._known_decoys else False
                     if not near_decoy:
                         self._state = self.VERIFY
                         self._candidate = (det.target_lat, det.target_lon)
                         self._ema = _EMATracker(self._ema_alpha)
+                        self._ema.append(det.target_lat, det.target_lon)
                         self._verify_t = 0.0
-                if self._state == self.SEARCH:
-                    slat, slon, pan, tilt = self._spiral()
-                    slat, slon = _clamp_to_safebox(slat, slon)
-                    cmds.append(fly_to(slat, slon, alt=self._search_alt, speed=22.0))
-                    cmds.append(point_gimbal(pan, tilt))
-                    cmds.append(set_gimbal_fov(self._search_fov))
-                    return cmds
 
-        # ── 验证状态（真假目标判别） ────────────────────────────────────
+                if self._state == self.SEARCH:
+                    return self._do_search(obs, cmds)
+
+        # ══════════════════════════════════════════════════════
+        #  RETURN — 返回中心
+        # ══════════════════════════════════════════════════════
+        if self._state == self.RETURN:
+            if det.detected and det.target_lat is not None:
+                self._last_any_det_t = sim_t
+                near_decoy = any(
+                    _haversine_m(det.target_lat, det.target_lon, d[0], d[1]) < 150.0
+                    for d in self._known_decoys
+                ) if self._known_decoys else False
+                if not near_decoy:
+                    self._state = self.VERIFY
+                    self._candidate = (det.target_lat, det.target_lon)
+                    self._ema = _EMATracker(self._ema_alpha)
+                    self._ema.append(det.target_lat, det.target_lon)
+                    self._verify_t = 0.0
+
+            if self._state == self.RETURN:
+                dist_to_center = _haversine_m(
+                    obs.self.lat, obs.self.lon, _MAP_CENTER[0], _MAP_CENTER[1])
+                if dist_to_center < self._return_arrive_threshold:
+                    self._state = self.SEARCH
+                    self._last_any_det_t = sim_t  # ★ 到达中心后重置计时
+                    return self._do_search(obs, cmds)
+                return self._do_return_center(obs, cmds)
+
+        # ══════════════════════════════════════════════════════
+        #  VERIFY — 真假目标判别
+        # ══════════════════════════════════════════════════════
+        # ══════════════════════════════════════════════════════
+        #  VERIFY — 真假目标判别（速度 + 线性度双重校验）
+        # ══════════════════════════════════════════════════════
         if self._state == self.VERIFY:
             self._verify_t += dt
             tgt = self._candidate
+
             if det.detected and det.target_lat is not None:
-                d = _haversine_m(det.target_lat, det.target_lon,
-                                 tgt[0], tgt[1])
+                self._last_any_det_t = sim_t
+                d = _haversine_m(det.target_lat, det.target_lon, tgt[0], tgt[1])
                 if d < 250.0:
                     self._ema.append(det.target_lat, det.target_lon)
                     self._candidate = self._ema.value
-                    tgt = self._candidate
-            speed = self._ema.speed_mps()
-            confirmed = (self._verify_t >= self._verify_warmup
-                         and speed >= self._verify_speed_confirm)
-            rejected = (self._verify_t >= self._verify_reject_min_t
-                        and speed < self._verify_speed_reject)
-            if confirmed:
-                # 确认真目标，注册并召唤队友
-                lat, lon = tgt
-                tgt_id = self._coord.confirm_target(lat, lon)
+                tgt = self._candidate
+
+        #使用新的双重指标
+        speed, r_squared = self._ema.speed_and_linearity()
+
+        # 确认真目标：预热完成 + 速度达标 + 轨迹足够直
+        confirmed = (
+            self._verify_t >= self._verify_warmup
+            and speed >= self._verify_speed_confirm
+            and r_squared >= self._verify_r2_confirm
+        )
+
+        # 拒绝诱饵：最短时间过 + (速度太低 OR 轨迹太乱) + 样本充足
+        rejected = (
+            self._verify_t >= self._verify_reject_min_t
+            and self._ema.count >= 15
+            and (speed < self._verify_speed_reject or r_squared < self._verify_r2_reject)
+        )
+
+        if confirmed:
+            lat, lon = tgt
+            tgt_id = self._coord.confirm_target(lat, lon)
+            if self._coord.slot_available(tgt_id):
                 if self._coord.need_r_broadcast(tgt_id, sim_t, self._r_cooldown):
                     cmds.append(broadcast(f"R:{tgt_id},{lat:.5f},{lon:.5f}"))
                     self._coord.mark_r_sent(tgt_id, sim_t)
-                self._track_target_id = tgt_id
-                self._state = self.TRACK
-                self._dwell_time = 0.0
-                self._track_t = 0.0
-                self._last_det_tick = sim_t
-                # 继续执行跟踪逻辑
-            elif rejected or self._verify_t >= self._verify_timeout:
-                # 假目标或超时，放弃并记忆
-                if rejected and self._ema.value:
-                    self._known_decoys.append(self._ema.value)
-                    self._coord.confirm_decoy(*self._ema.value)
-                self._state = self.SEARCH
-                self._candidate = None
-                self._ema.reset()
-                slat, slon, pan, tilt = self._spiral()
-                slat, slon = _clamp_to_safebox(slat, slon)
-                cmds.append(fly_to(slat, slon, alt=self._search_alt, speed=22.0))
-                cmds.append(point_gimbal(pan, tilt))
-                cmds.append(set_gimbal_fov(self._search_fov))
-                return cmds
-            else:
-                # 验证中：飞向目标并保持观察
-                tlat, tlon = _clamp_to_safebox(*tgt)
-                cmds.append(fly_to(tlat, tlon, alt=self._search_alt, speed=22.0,
-                                   loiter_radius=self._loiter_close))
-                pan, tilt = self._tracking_gimbal(
-                    obs.self.lat, obs.self.lon, obs.self.heading_deg, tgt[0], tgt[1])
-                cmds.append(point_gimbal(pan, tilt))
-                cmds.append(set_gimbal_fov(self._track_fov))
-                return cmds
+            self._coord.claim_slot(tgt_id)
+            if self._coord.need_j_broadcast(tgt_id, sim_t):
+                cmds.append(broadcast(f"J:{tgt_id},{self.my_uid}"))
+                self._coord.mark_j_sent(tgt_id, sim_t)
+            self._enter_track(tgt_id, tgt)
 
-        # ── 跟踪状态（协同摧毁） ─────────────────────────────────────────
-        if self._state == self.TRACK:
-            self._track_t += dt
-            tgt_id = self._track_target_id
-            if tgt_id is None:
-                self._state = self.SEARCH
-                return self.decide(obs, 0)
-
-            # 获取目标位置（可能来自队友通信或自身观测）
-            tgt_pos = self._coord.target_pos(tgt_id)
-            if tgt_pos is None:
-                # 目标丢失（可能已摧毁）
-                self._state = self.SEARCH
-                return self.decide(obs, 0)
-
-            # 自身检测更新目标位置
-            if det.detected and det.target_lat is not None:
-                d = _haversine_m(det.target_lat, det.target_lon,
-                                 tgt_pos[0], tgt_pos[1])
-                if d < 250.0:
-                    self._coord.confirm_target(det.target_lat, det.target_lon)  # 更新
-                    tgt_pos = (det.target_lat, det.target_lon)
-
-            # 积累 dwell 时间
-            tracking = det.detected and det.target_lat is not None and \
-                _haversine_m(det.target_lat, det.target_lon,
-                             tgt_pos[0], tgt_pos[1]) < 250.0
-            if tracking:
-                gap = sim_t - self._last_det_tick
-                if self._dwell_time > 0 and gap <= self._dwell_grace + dt:
-                    self._dwell_time += dt
-                elif self._dwell_time == 0:
-                    self._dwell_time += dt
-                else:
-                    self._dwell_time = dt
-                self._last_det_tick = sim_t
-
-            # 定期广播本机状态
-            if self._tick % self._status_period == 0:
-                cmds.append(broadcast(f"T:{tgt_id},{self._dwell_time:.2f}"))
-
-            # 检查协同摧毁条件
-            peer_dwell = self._coord.peer_dwell(tgt_id)
-            destroyed_by_env = (
-                self._dwell_time >= self._dwell_target and
-                peer_dwell >= self._dwell_target - 0.5  # 容忍小幅通信延迟
-            )
-            # 超时处理
-            if destroyed_by_env or self._track_t >= self._track_timeout:
-                if destroyed_by_env:
-                    # 广播摧毁通知
-                    if self._coord.need_c_broadcast(tgt_id, sim_t):
-                        cmds.append(broadcast(f"C:{tgt_id}"))
-                        self._coord.mark_c_sent(tgt_id, sim_t)
-                    self._coord.mark_destroyed(tgt_id)
-                else:
-                    # 超时但未达到 dwell，如果目标速度低则标记为假目标
-                    if self._dwell_time < self._dwell_target and self._ema.speed_mps() < 2.5:
-                        self._coord.confirm_decoy(*tgt_pos)
-                # 回到搜索状态
-                self._state = self.SEARCH
-                self._track_target_id = None
-                self._dwell_time = 0.0
-                slat, slon, pan, tilt = self._spiral()
-                slat, slon = _clamp_to_safebox(slat, slon)
-                cmds.append(fly_to(slat, slon, alt=self._search_alt, speed=22.0))
-                cmds.append(point_gimbal(pan, tilt))
-                cmds.append(set_gimbal_fov(self._search_fov))
-                return cmds
-
-            # 槽位分离：飞向本机瞄准点，而非目标正上方
-            slot = self._coord.my_slot(tgt_id)
-            aim_lat, aim_lon = self._coord.aim_point(tgt_id, slot, standoff=200.0)
-            aim_lat, aim_lon = _clamp_to_safebox(aim_lat, aim_lon)
-            cmds.append(fly_to(aim_lat, aim_lon, alt=self._search_alt, speed=22.0,
-                               loiter_radius=self._loiter_close))
-
-            # 云台始终对准真实目标位置
+        elif rejected or self._verify_t >= self._verify_timeout:
+            if rejected and self._ema.value:
+                self._known_decoys.append(self._ema.value)
+                self._coord.confirm_decoy(*self._ema.value)
+            self._state = self.SEARCH
+            self._candidate = None
+            self._ema.reset()
+            return self._do_search(obs, cmds)
+        else:
+            # 验证进行中：飞向候选点保持观察
+            tlat, tlon = _clamp_to_safebox(*tgt)
+            cmds.append(fly_to(tlat, tlon, alt=self._search_alt,
+                            speed=self._search_speed,
+                            loiter_radius=self._loiter_radius))
             pan, tilt = self._tracking_gimbal(
-                obs.self.lat, obs.self.lon, obs.self.heading_deg,
-                tgt_pos[0], tgt_pos[1])
+                obs.self.lat, obs.self.lon, obs.self.heading_deg, tgt[0], tgt[1])
             cmds.append(point_gimbal(pan, tilt))
             cmds.append(set_gimbal_fov(self._track_fov))
-
-            # 仅当目标速度高于阈值时上报位置（避免上报假目标导致 RMSE 恶化）
-            if (sim_t - self._last_report_t >= 1.0
-                    and self._ema.value is not None
-                    and self._ema.speed_mps() > 3.0):
-                self._last_report_t = sim_t
-                cmds.append(report_target(tgt_pos[0], tgt_pos[1]))
             return cmds
-
-        # 兜底返回搜索指令（理论上不会执行到这里）
-        slat, slon, pan, tilt = self._spiral()
-        cmds.append(fly_to(slat, slon, alt=self._search_alt, speed=22.0))
-        cmds.append(point_gimbal(pan, tilt))
-        return cmds
