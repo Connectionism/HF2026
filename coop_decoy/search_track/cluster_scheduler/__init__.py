@@ -1,9 +1,5 @@
-# -*- coding: utf-8 -*-
 """
-集群调度模块 - K=2协同分配 + 站位策略 + 状态机
+协同调度模块 - 双机协同任务分配 + 状态机
 
-负责人: 成员3 (核心难点模块)
-模块文件:
-  coordinator.py   K=2协同分配 + 贪婪自选 + 站位策略
-  state_machine.py SEARCH->VERIFY->TRACK->RELEASE 状态机
+对外入口: main.py → CooperativeCoordinator, StateMachineHandler
 """

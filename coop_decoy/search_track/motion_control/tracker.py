@@ -1,215 +1,136 @@
 """
-src/motion_control/tracker.py
-跟踪模块：支持单机动态绕圈 和 多机固定站位（阶段二优化）
+盘旋跟踪模块
 
-【官方代码借鉴说明】
-- 单机绕圈逻辑 → 参考 coop_distributed.py 的 _tracking_gimbal() + fly_to 组合
-- 多机站位策略 → 参考 swarm_coordinated.py 的 _team_aim_point() 方法
-- 云台瞄准（pan/tilt计算）→ 参考 coop_distributed.py 的 _tracking_gimbal() 方法
-- 云台角度平滑 → 阶段二新增，官方无此机制（参考 EMA 滤波思想）
+来源: new drone_agent.py _get_single_loiter_waypoint/_get_multi_loiter_waypoint/_los_angles
+功能: 单机/多机盘旋跟踪航点 + 云台瞄准角度计算
 """
-from typing import Optional, Tuple
+from __future__ import annotations
+
+import hashlib
+import logging
+import math
+from typing import List, Optional, Tuple
+
 from .geo import (
-    haversine_m, bearing_deg, los_angles, point_on_circle,
-    DEFAULT_ALTITUDE, clamp_to_safebox,
-    LAT_MIN, LAT_MAX, LON_MIN, LON_MAX  # 用于场景中心计算
+    clamp_to_safebox, haversine_m, bearing_deg, point_on_circle, los_angles,
 )
-try:
-    from sdk.core.commands import fly_to, point_gimbal, Command
-except ImportError:
-    try:
-        from competition.sdk.core.commands import fly_to, point_gimbal, Command
-    except ImportError:
-        from dataclasses import dataclass
 
-        @dataclass(frozen=True)
-        class Command:
-            verb: str
-            params: dict
+logger = logging.getLogger(__name__)
 
-        def fly_to(lat, lon, alt=None, speed=None, loiter_radius=200.0):
-            params = {"latitude": float(lat), "longitude": float(lon), "loiter_radius": float(loiter_radius)}
-            if alt is not None: params["altitude"] = float(alt)
-            if speed is not None: params["speed"] = float(speed)
-            return Command("set_destination", params)
-
-        def point_gimbal(pan, tilt):
-            return Command("component.gimbal_tracking.set_orientation", {"pan": float(pan), "tilt": float(tilt)})
+from competition.sdk.core.commands import Command, fly_to, point_gimbal, set_gimbal_fov
 
 
-class LoiterTracker:
+class TrackController:
     """
-    跟踪器：根据 multi_drone 切换单目标 / 双槽位跟踪。
-   【官方代码借鉴说明】
-    - 整体结构 → 参考 coop_distributed.py 中 TRACK 状态的处理逻辑
-    - 多机站位 → 参考 swarm_coordinated.py 的 _team_aim_point() 方法（核心借鉴）
+    盘旋跟踪控制器
+
+    支持两种模式：
+    - 单机盘旋：动态顺时针/逆时针绕目标
+    - 多机盘旋：基于目标 hash 的固定方位角，两机对向分布
     """
 
     def __init__(
         self,
-        uav_name: str,
-        multi_drone: bool = False,
-        radius_m: float = 350.0,          # 单机盘旋半径（米）
-        altitude: float = DEFAULT_ALTITUDE,
-        speed: float = 24.0,
-        turn_direction: str = "right",    # 单机盘旋方向 "right"/"left"
-        multi_radius: float = 330.0,      # 多机跟踪环半径（确保 2*radius > 200m）
-        filter_alpha: float = 0.3,        # 云台角度平滑系数
+        my_uid: str,
+        loiter_radius: float = 450.0,
+        multi_loiter_radius: float = 450.0,
+        loiter_close: float = 250.0,
+        turn_direction: str = "right",
+        track_fov: float = 30.0,
     ):
-        self.uav_name = uav_name
-        self.multi_drone = multi_drone
-        self.altitude = altitude
-        self.speed = speed
+        self._my_uid = my_uid
+        self._loiter_radius = loiter_radius
+        self._multi_loiter_radius = multi_loiter_radius
+        self._loiter_close = loiter_close
+        self._turn_direction = turn_direction
+        self._track_fov = track_fov
 
-        # 单机模式属性
-        self.radius_m = radius_m
-        self.turn_direction = turn_direction
-
-        # 多机模式属性
-        # 【借鉴】swarm_coordinated.py 中 _TRACK_LOITER = 330.0
-        self.multi_radius = multi_radius
-        self.filter_alpha = filter_alpha
-
-        # 当前跟踪目标
-        self.current_target: Optional[Tuple[float, float]] = None
-        self.slot = 0
-
-        # 云台平滑状态
-        self._last_pan = 0.0
-        self._last_tilt = 0.0
-        self._initialized = False
-
-    def reset(self):
-        """重置跟踪状态"""
-        self.current_target = None
-        self.slot = 0
-        self._initialized = False
-        self._last_pan = 0.0
-        self._last_tilt = 0.0
-
-    def set_target(self, target_lat: float, target_lon: float, slot: int = 0):
-        """设置要跟踪的目标及槽位（多机模式下 slot 有效）"""
-        self.current_target = (target_lat, target_lon)
-        if self.multi_drone:
-            self.slot = slot
-        else:
-            self.slot = 0
-
-    def clear_target(self):
-        """释放当前目标"""
-        self.current_target = None
-
-    def is_active(self) -> bool:
-        return self.current_target is not None
-
-    def _get_single_loiter_waypoint(
-        self,
-        uav_lat: float,
-        uav_lon: float
-    ) -> Optional[Tuple[float, float]]:
-        """单机模式：动态顺时针/逆时针绕圈
-
-        【官方代码借鉴】参考 coop_distributed.py 的 TRACK 状态：
-        - fly_to(tgt, loiter_radius=100) 实现在目标附近绕圈
-        - 这里用 point_on_circle 计算盘旋点，实现更精确的圆形轨迹
+    def get_single_loiter_waypoint(
+        self, uav_lat: float, uav_lon: float,
+        tgt_lat: float, tgt_lon: float
+    ) -> Tuple[float, float]:
         """
-        if self.current_target is None:
-            return None
-        tgt_lat, tgt_lon = self.current_target
+        单机模式：动态顺时针/逆时针绕目标盘旋。
+        """
         brg_from_target = bearing_deg(tgt_lat, tgt_lon, uav_lat, uav_lon)
-        offset = 90.0 if self.turn_direction == "right" else -90.0
+        offset = 90.0 if self._turn_direction == "right" else -90.0
         loiter_angle = (brg_from_target + offset) % 360.0
-        wp_lat, wp_lon = point_on_circle(tgt_lat, tgt_lon, self.radius_m, loiter_angle)
+        wp_lat, wp_lon = point_on_circle(
+            tgt_lat, tgt_lon, self._loiter_radius, loiter_angle)
         return clamp_to_safebox(wp_lat, wp_lon)
 
-    def _get_multi_loiter_waypoint(
-        self,
-        uav_lat: float,
-        uav_lon: float
-    ) -> Optional[Tuple[float, float]]:
+    def get_multi_loiter_waypoint(
+        self, uav_lat: float, uav_lon: float,
+        tgt_lat: float, tgt_lon: float, slot: int
+    ) -> Tuple[float, float]:
         """
-        多机模式：基于目标到场景中心的方位角分配槽位。
-        K=2 时 slot0 偏移 0°，slot1 偏移 180°，确保两机间距为 2*radius。
-
-        【核心借鉴】swarm_coordinated.py 的 _team_aim_point() 方法
+        多机模式：用目标绝对坐标 hash 计算固定方位盘旋点。
+        两机基于同一目标算出 0° 和 180° 的固定方位，始终保持对向。
         """
-        if self.current_target is None:
-            return None
-        tgt_lat, tgt_lon = self.current_target
+        tgt_key = f"{tgt_lat:.5f}_{tgt_lon:.5f}"
+        h = int(hashlib.md5(tgt_key.encode()).hexdigest(), 16)
+        base_angle = float(h % 360)
 
-        # 场景几何中心
-        #【借鉴】swarm_coordinated.py 的 _team_aim_point() 
-        scene_center_lat = (LAT_MIN + LAT_MAX) / 2.0
-        scene_center_lon = (LON_MIN + LON_MAX) / 2.0
+        loiter_angle = (base_angle + slot * 180.0) % 360.0
 
-        # 目标到场景中心的方位角（作为基准方向）
-        sector_base = bearing_deg(tgt_lat, tgt_lon, scene_center_lat, scene_center_lon)
-
-        # K=2: slot0 -> 0°, slot1 -> 180°
-        offset = 0.0 if self.slot == 0 else 180.0
-        loiter_angle = (sector_base + offset) % 360.0
-
-        wp_lat, wp_lon = point_on_circle(tgt_lat, tgt_lon, self.multi_radius, loiter_angle)
+        wp_lat, wp_lon = point_on_circle(
+            tgt_lat, tgt_lon, self._multi_loiter_radius, loiter_angle)
         return clamp_to_safebox(wp_lat, wp_lon)
 
-    def get_loiter_waypoint(
+    def get_track_commands(
         self,
-        uav_lat: float,
-        uav_lon: float
-    ) -> Optional[Tuple[float, float]]:
-        """根据 multi_drone 选择盘旋点计算方式"""
-        if self.multi_drone:
-            return self._get_multi_loiter_waypoint(uav_lat, uav_lon)
-        else:
-            return self._get_single_loiter_waypoint(uav_lat, uav_lon)
+        uav_lat: float, uav_lon: float, uav_alt: float, uav_yaw: float,
+        tgt_lat: float, tgt_lon: float,
+        slot: int = 0,
+        multi_search: bool = True,
+        tracking: bool = True,
+    ) -> List[Command]:
+        """
+        生成跟踪命令：飞向盘旋点 + 云台瞄准目标。
 
-    def generate_commands(
+        Args:
+            uav_lat/uav_lon/uav_alt/uav_yaw: 本机位姿
+            tgt_lat/tgt_lon: 目标位置
+            slot: 多机槽位 (0 或 1)
+            multi_search: 是否多机模式
+            tracking: 是否正在跟踪（影响逼近速度）
+        """
+        if multi_search:
+            aim_lat, aim_lon = self.get_multi_loiter_waypoint(
+                uav_lat, uav_lon, tgt_lat, tgt_lon, slot)
+        else:
+            aim_lat, aim_lon = self.get_single_loiter_waypoint(
+                uav_lat, uav_lon, tgt_lat, tgt_lon)
+        aim_lat, aim_lon = clamp_to_safebox(aim_lat, aim_lon)
+
+        approach_speed = 30.0 if not tracking else 22.0
+
+        cmds: List[Command] = []
+        cmds.append(fly_to(aim_lat, aim_lon, speed=approach_speed,
+                           loiter_radius=self._loiter_close))
+
+        pan, tilt = los_angles(
+            uav_lat, uav_lon, uav_alt, uav_yaw, tgt_lat, tgt_lon)
+        cmds.append(point_gimbal(pan, tilt))
+        cmds.append(set_gimbal_fov(self._track_fov))
+
+        return cmds
+
+    def get_verify_commands(
         self,
-        uav_name: str,
-        uav_lat: float,
-        uav_lon: float,
-        uav_alt: float,
-        uav_yaw: float
-    ) -> list[Command]:
-        """
-        生成控制命令：导航到盘旋点 + 云台瞄准目标（带平滑滤波）。
-        uav_name 用于标识（当前仅占位）。
+        uav_lat: float, uav_lon: float, uav_alt: float, uav_yaw: float,
+        tgt_lat: float, tgt_lon: float,
+        search_fov: float = 50.0,
+    ) -> List[Command]:
+        """生成验证状态命令：飞向目标 + 云台对准（大FOV）。"""
+        tlat, tlon = clamp_to_safebox(tgt_lat, tgt_lon)
+        pan, tilt = los_angles(
+            uav_lat, uav_lon, uav_alt, uav_yaw, tgt_lat, tgt_lon)
+        return [
+            fly_to(tlat, tlon, speed=22.0, loiter_radius=self._loiter_close),
+            point_gimbal(pan, tilt),
+            set_gimbal_fov(search_fov),
+        ]
 
-        【官方代码借鉴】参考 coop_distributed.py 的 TRACK 状态：
-        1. fly_to() 飞向盘旋点（loiter_radius 参数在 fly_to 中设置）
-        2. point_gimbal() 瞄准目标
-        3. 持续 report_target() 上报（本模块仅生成云台命令，上报由上层处理）
-        """
-        _ = uav_name  # 占位
-        if self.current_target is None:
-            return []
-
-        commands = []
-
-        # 1. 导航命令
-        # 【借鉴】coop_distributed.py TRACK 状态中的 fly_to(tgt, loiter_radius=...)
-        wp = self.get_loiter_waypoint(uav_lat, uav_lon)
-        if wp is not None:
-            commands.append(fly_to(wp[0], wp[1], alt=self.altitude, speed=self.speed))
-
-        # 2. 云台瞄准命令（带一阶低通滤波）
-        tgt_lat, tgt_lon = self.current_target
-        pan_raw, tilt_raw = los_angles(
-            uav_lat, uav_lon, uav_alt, uav_yaw,
-            tgt_lat, tgt_lon, tgt_alt=0.0
-        )
-
-        if not self._initialized:
-            pan_smooth = pan_raw
-            tilt_smooth = tilt_raw
-            self._initialized = True
-        else:
-            alpha = self.filter_alpha
-            pan_smooth = alpha * pan_raw + (1 - alpha) * self._last_pan
-            tilt_smooth = alpha * tilt_raw + (1 - alpha) * self._last_tilt
-
-        self._last_pan = pan_smooth
-        self._last_tilt = tilt_smooth
-        commands.append(point_gimbal(pan_smooth, tilt_smooth))
-
-        return commands
+    def reset(self) -> None:
+        pass

@@ -1,206 +1,257 @@
 """
-src/motion_control/search.py
-搜索模块：支持单机全域螺旋 和 多机精细扇区螺旋（阶段二优化）
+搜索航点生成模块
 
-【官方代码借鉴说明】
-- 多机扇区划分思路 → 参考 competition/baselines/coop_distributed.py 的 _uid_partition()
-- 扇区内扩张螺旋算法 → 参考 competition/baselines/coop_distributed.py 的 _spiral()
-- 多机螺旋参数（半径步进300m，角度步进15°）→ 在官方基础上优化，提高覆盖率
+来源: new drone_agent.py _spiral/_make_search_cmds/_get_multi_search_waypoint/_get_single_search_waypoint
+功能: 螺旋搜索 + 网格蛇形扫描 + 扇区分区搜索
 """
-from typing import Tuple
+from __future__ import annotations
+
+import hashlib
+import logging
+import math
+from typing import List, Tuple
+
 from .geo import (
-    clamp_to_safebox, point_on_circle,
-    DEFAULT_ALTITUDE, LAT_MIN, LAT_MAX, LON_MIN, LON_MAX
+    clamp_to_safebox, haversine_m, bearing_deg, point_on_circle,
+    partition_centers, uid_phase, uid_partition_idx, bbox_inset,
 )
-try:
-    from sdk.core.commands import fly_to, Command
-except ImportError:
-    try:
-        from competition.sdk.core.commands import fly_to, Command
-    except ImportError:
-        from dataclasses import dataclass
 
-        @dataclass(frozen=True)
-        class Command:
-            verb: str
-            params: dict
+logger = logging.getLogger(__name__)
 
-        def fly_to(lat, lon, alt=None, speed=None, loiter_radius=200.0):
-            params = {"latitude": float(lat), "longitude": float(lon), "loiter_radius": float(loiter_radius)}
-            if alt is not None: params["altitude"] = float(alt)
-            if speed is not None: params["speed"] = float(speed)
-            return Command("set_destination", params)
-
-# 地图几何中心（用于螺旋搜索原点）
-# 借鉴：coop_distributed.py 中 _BBOX 定义了地图边界，这里计算中心点
-CENTER_LAT = (LAT_MIN + LAT_MAX) / 2.0   # ≈ 27.0034
-CENTER_LON = (LON_MIN + LON_MAX) / 2.0   # ≈ 125.00015
-
-# 多机模式：3 架 UAV 的扇区中心方位角（度）
-# 借鉴：coop_distributed.py 中 _uid_partition() 使用 uid 哈希分区，
-# 这里改用固定扇区中心（0°/120°/240°），确保三机均匀覆盖
-UID_TO_SECTOR_CENTER = {
-    "20001": 0.0,    # uav_alpha  -> 西北区域
-    "20002": 120.0,  # uav_bravo  -> 东南区域
-    "20003": 240.0,  # uav_charlie -> 西南区域
-}
+from competition.sdk.core.commands import Command, fly_to, point_gimbal, set_gimbal_fov
 
 
-class SectorSearch:
+_BBOX: Tuple[Tuple[float, float], Tuple[float, float]] = (
+    (26.982, 124.980), (27.025, 125.020))
+_SAFEBOX_MARGIN_M = 600.0
+_SAFEBOX = bbox_inset(_BBOX, _SAFEBOX_MARGIN_M)
+_PARTITION_CENTERS = partition_centers(_BBOX, 3)
+
+
+class SearchController:
     """
-    搜索器：根据 multi_drone 标志自动切换单机/多机搜索策略。
+    搜索航点生成控制器
 
-    【官方代码借鉴说明】
-    - 整体状态设计 → 参考 coop_distributed.py 的 CoopDistributedAgent 类结构
-    - 单机全域螺旋 → 参考 coop_distributed.py 的 _spiral() 展开方式
-    - 多机扇区螺旋 → 参考 coop_distributed.py 的 _spiral() + _uid_partition()
+    支持三种搜索模式：
+    - 螺旋搜索 (_spiral)：从分区中心出发，螺旋扩张搜索
+    - 多机网格扫描 (_get_multi_search_waypoint)：三机按经度条带蛇形扫描
+    - 单机网格扫描 (_get_single_search_waypoint)：全域蛇形扫描
     """
 
     def __init__(
         self,
-        uav_name: str,
-        multi_drone: bool = False,
-        altitude: float = DEFAULT_ALTITUDE,
-        # 单机螺旋参数
-        init_radius: float = 300.0,
-        radius_step: float = 400.0,
-        angle_step: float = 25.0,
-        # 多机螺旋参数（阶段二优化）
-        # 借鉴：coop_distributed.py 中 _spiral() 使用 growth=50, ang_speed=30
-        # 这里将半径步进从 500m 优化为 300m，角度步进从 30° 优化为 15°
-        multi_init_radius: float = 800.0,   # 初始半径（从近处开始扫描）
-        multi_radius_step: float = 300.0,   # 每圈半径增量（官方约500m，优化为300m提升覆盖率）
-        multi_angle_step: float = 15.0,     # 角度步进（官方约30°，优化为15°提升覆盖率）
-        multi_max_radius: float = 3500.0,   # 最大半径（地图对角线约7900m）
+        my_uid: str,
+        search_radius: float = 300.0,
+        growth: float = 15.0,
+        ang_speed: float = 30.0,
+        sweep_period: float = 4.0,
+        pitch_min: float = -60.0,
+        pitch_max: float = -30.0,
+        search_fov: float = 50.0,
+        grid_scan_spacing_m: float = 400.0,
     ):
-        self.uav_name = uav_name
-        self.multi_drone = multi_drone
-        self.altitude = altitude
+        self._my_uid = my_uid
+        self._search_radius = search_radius
+        self._growth = growth
+        self._ang_speed = ang_speed
+        self._sweep_period = sweep_period
+        self._pitch_min = pitch_min
+        self._pitch_max = pitch_max
+        self._search_fov = search_fov
+        self._grid_scan_spacing_m = grid_scan_spacing_m
 
-        # 单机模式属性
-        self.current_radius = init_radius
-        self.current_angle = 0.0
-        self.radius_step = radius_step
-        self.angle_step = angle_step
-        self.first_run = True
+        self._region = _PARTITION_CENTERS[uid_partition_idx(my_uid)]
+        self._phase = uid_phase(my_uid)
 
-        # 多机模式属性
-        if multi_drone:
-            # 【借鉴】coop_distributed.py 的 _uid_partition() 根据 uid 分配区域
-            # 这里兼容 uav_alpha / 20001 两种命名方式
-            uid = uav_name if uav_name in UID_TO_SECTOR_CENTER else None
-            if uid is None:
-                name_to_uid = {
-                    "uav_alpha": "20001",
-                    "uav_bravo": "20002",
-                    "uav_charlie": "20003"
-                }
-                uid = name_to_uid.get(uav_name)
-            self.sector_center_deg = UID_TO_SECTOR_CENTER.get(uid, 0.0)
-            self.multi_radius = multi_init_radius
-            self.multi_angle_offset = 0.0
-            self.multi_radius_step = multi_radius_step
-            self.multi_angle_step = multi_angle_step
-            self.multi_max_radius = multi_max_radius
+        # 网格扫描运行时状态
+        self._grid_scan_sector: Tuple[float, float, float, float] = (0, 0, 0, 0)
+        self._grid_scan_phase: float = 0.0
+        self._grid_scan_inited: bool = False
+
+    def _spiral(self, t: float) -> Tuple[float, float, float, float]:
+        """
+        三方向螺旋搜索：从分区中心出发，以自转角度线性增长半径，
+        到达最大搜索半径后不再向外扩散，向内循环往复搜索。
+
+        返回 (lat, lon, pan, tilt)
+        """
+        home_lat, home_lon = self._region
+        t = t + self._phase * 12.0
+
+        bearing = (self._ang_speed * t) % 360.0
+        revs = (self._ang_speed * t) / 360.0
+
+        raw_radius = max(1.0, self._growth * revs)
+        if raw_radius > self._search_radius:
+            fold_count = int(raw_radius / self._search_radius)
+            rem = raw_radius - fold_count * self._search_radius
+            if fold_count % 2 == 0:
+                radius = 1.0 + rem
+            else:
+                radius = self._search_radius - rem
+            radius = max(1.0, min(self._search_radius, radius))
         else:
-            self.sector_center_deg = 0.0
+            radius = raw_radius
 
-    def reset(self):
-        """重置搜索状态（每局开始时调用）"""
-        self.first_run = True
-        self.current_radius = 300.0
-        self.current_angle = 0.0
-        if self.multi_drone:
-            self.multi_radius = 800.0
-            self.multi_angle_offset = 0.0
+        dlat = (radius * math.cos(math.radians(bearing))) / 111320.0
+        dlon = (radius * math.sin(math.radians(bearing))) / \
+               (111320.0 * math.cos(math.radians(home_lat)))
 
-    def _get_single_waypoint(self) -> Tuple[float, float]:
+        phase = (t % self._sweep_period) / self._sweep_period
+        tilt = self._pitch_min + (self._pitch_max - self._pitch_min) * 0.5 * \
+               (1 - math.cos(2 * math.pi * phase))
+
+        pan_phase = (t % (self._sweep_period * 2)) / (self._sweep_period * 2)
+        pan = -90.0 + 180.0 * 0.5 * (1 - math.cos(2 * math.pi * pan_phase))
+
+        slat = home_lat + dlat
+        slon = home_lon + dlon
+        slat, slon = clamp_to_safebox(slat, slon)
+        return slat, slon, pan, tilt
+
+    def get_multi_search_waypoint(self, t: float) -> Tuple[float, float]:
         """
-        单机模式：全域扩张螺旋
-
-        【官方代码借鉴】参考 coop_distributed.py 的 _spiral() 方法：
-        - 螺旋半径随时间增长 (growth * revs)
-        - 角度随时间线性增加 (ang_speed * t)
-        - 这里简化为以角度步进和半径步进驱动
+        多机模式：网格扫描（割草机/蛇形路径）。
+        三机按经度均分地图条带，条带之间重叠 30%。
         """
-        if self.first_run:
-            self.first_run = False
-            return clamp_to_safebox(CENTER_LAT + 0.0005, CENTER_LON)
+        (lat_min, lon_min), (lat_max, lon_max) = _SAFEBOX
+        n_uavs = 3
+        speed = 22.0
 
-        # 【借鉴】_spiral() 中的螺旋坐标计算：radius * cos(bearing) / 111320
-        target_lat, target_lon = point_on_circle(
-            CENTER_LAT,
-            CENTER_LON,
-            self.current_radius,
-            self.current_angle
-        )
-        # 更新螺旋状态
-        self.current_angle += self.angle_step
-        if self.current_angle >= 360.0:
-            self.current_angle -= 360.0
-            self.current_radius += self.radius_step
-        return clamp_to_safebox(target_lat, target_lon)
+        _FULL_SCAN_INTERVAL = 30.0
+        _FULL_SCAN_DURATION = 4.0
+        _full_scan_phase = int(t / _FULL_SCAN_INTERVAL)
+        _full_scan_offset = t - _full_scan_phase * _FULL_SCAN_INTERVAL
+        _use_full_scan = (_full_scan_offset < _FULL_SCAN_DURATION)
 
-    def _get_multi_waypoint(self) -> Tuple[float, float]:
-        """
-        多机模式：扇区内精细螺旋扫描
+        if not self._grid_scan_inited:
+            sector_width = (lon_max - lon_min) / n_uavs
+            sector_idx = uid_partition_idx(self._my_uid)
+            base_lon_min = lon_min + sector_width * sector_idx
+            base_lon_max = lon_min + sector_width * (sector_idx + 1)
+            overlap_extend = sector_width * 0.15
+            self._grid_scan_sector = (
+                lat_min,
+                max(lon_min, base_lon_min - overlap_extend),
+                lat_max,
+                min(lon_max, base_lon_max + overlap_extend),
+            )
+            phase = uid_phase(self._my_uid)
+            self._grid_scan_phase = phase
+            self._grid_scan_inited = True
 
-        【官方代码借鉴】参考 coop_distributed.py 的 _spiral() + _uid_partition()：
-        1. 扇区中心由 _uid_partition() 决定（这里用 UID_TO_SECTOR_CENTER）
-        2. _spiral() 中的 bearing = ang_speed * t，这里改为在扇区内左右摆动
-        3. 半径增长逻辑与单机一致，但步进更精细（300m/圈）
-        4. 超出最大半径后重置，实现多层覆盖（官方无此机制，为阶段二新增优化）
-        """
-        # 扇区内摆动：中心线左右交替偏移（30° 为最大摆动幅度）
-        # 例如：中心+15°, 中心-15°, 中心+30°, 中心-30° ...
-        # 【借鉴】_spiral() 的相位摆动思想，但将扫描方式改为扇区内摆动
-        swing = (int(self.multi_angle_offset / self.multi_angle_step) % 2) * 30.0
-        sign = 1.0 if (int(self.multi_angle_offset / self.multi_angle_step) % 2 == 0) else -1.0
-        actual_angle = self.sector_center_deg + sign * (30.0 + swing)
-        actual_angle %= 360.0
-
-        next_point = point_on_circle(
-            CENTER_LAT,
-            CENTER_LON,
-            self.multi_radius,
-            actual_angle
-        )
-
-        # 更新状态
-        self.multi_angle_offset += self.multi_angle_step
-        if self.multi_angle_offset >= 360.0:
-            self.multi_angle_offset = 0.0
-            self.multi_radius += self.multi_radius_step
-            # 【阶段二新增优化】超出最大半径后重置，实现多层覆盖
-            # 官方 coop_distributed.py 无此逻辑，螺旋半径会无限增长
-            if self.multi_radius > self.multi_max_radius:
-                self.multi_radius = 800.0
-                # 微调扇区中心，避免完全重复路径
-                self.sector_center_deg = (self.sector_center_deg + 15.0) % 360.0
-
-        return clamp_to_safebox(next_point[0], next_point[1])
-
-    def get_next_waypoint(self) -> Tuple[float, float]:
-        """获取下一个搜索航点（自动根据 multi_drone 切换）"""
-        if self.multi_drone:
-            return self._get_multi_waypoint()
+        if _use_full_scan:
+            sec_lat_min, sec_lon_min = lat_min, lon_min
+            sec_lat_max, sec_lon_max = lat_max, lon_max
         else:
-            return self._get_single_waypoint()
+            sec_lat_min, sec_lon_min, sec_lat_max, sec_lon_max = self._grid_scan_sector
 
-    def generate_commands(
-        self,
-        uav_name: str,
-        current_lat: float,
-        current_lon: float
-    ) -> list[Command]:
-        """
-        生成当前周期的控制命令。
+        lat_mid = (sec_lat_min + sec_lat_max) / 2.0
+        meters_per_deg_lon = 111320.0 * math.cos(math.radians(lat_mid))
+        sec_width_m = (sec_lon_max - sec_lon_min) * meters_per_deg_lon
+        sec_height_m = (sec_lat_max - sec_lat_min) * 111320.0
 
-        【官方代码借鉴】参考 coop_distributed.py 的 decide() 中：
-        - 搜索态调用 fly_to() 飞向螺旋点 + point_gimbal() 扫描
-        - 本方法仅生成 fly_to 命令，云台控制由上层或 tracker 模块负责
-        """
-        _ = uav_name  # 占位，预留多机扩展
-        target_lat, target_lon = self.get_next_waypoint()
-        # 【借鉴】coop_distributed.py 中搜索速度 = 22.0 m/s，这里取 24.0（调优表推荐）
-        return [fly_to(target_lat, target_lon, alt=self.altitude, speed=24.0)]
+        n_scanlines = max(2, int(sec_height_m / self._grid_scan_spacing_m))
+        margin_m = sec_width_m * 0.03
+        scan_width_m = sec_width_m - 2 * margin_m
+        round_trip_time = 2 * scan_width_m / speed
+
+        t_eff = t + self._grid_scan_phase * round_trip_time
+        raw_line = t_eff / round_trip_time
+        line_idx = int(raw_line)
+        frac_in_line = raw_line - line_idx
+
+        line_mod = line_idx % (2 * n_scanlines)
+        if line_mod < n_scanlines:
+            actual_line = line_mod
+            going_north = True
+        else:
+            actual_line = 2 * n_scanlines - 1 - line_mod
+            going_north = False
+
+        frac_lat = actual_line / max(1, n_scanlines - 1)
+        current_lat = sec_lat_min + frac_lat * (sec_lat_max - sec_lat_min)
+
+        if going_north:
+            current_lon_offset = margin_m + scan_width_m * (1.0 - frac_in_line)
+        else:
+            current_lon_offset = margin_m + scan_width_m * frac_in_line
+
+        current_lon_deg = sec_lon_min + current_lon_offset / meters_per_deg_lon
+
+        lookahead_s = 2.0
+        ahead_frac = frac_in_line + lookahead_s / round_trip_time
+        if going_north:
+            ahead_lon_offset = margin_m + scan_width_m * max(0.0, 1.0 - ahead_frac)
+        else:
+            ahead_lon_offset = margin_m + scan_width_m * min(1.0, ahead_frac)
+        ahead_lon_deg = sec_lon_min + ahead_lon_offset / meters_per_deg_lon
+
+        return clamp_to_safebox(current_lat, ahead_lon_deg)
+
+    def get_single_search_waypoint(self, t: float) -> Tuple[float, float]:
+        """单机模式：全域网格扫描（基于全局时间 t 连续运动）。"""
+        (lat_min, lon_min), (lat_max, lon_max) = _SAFEBOX
+        speed = 22.0
+        lat_mid = (lat_min + lat_max) / 2.0
+        meters_per_deg_lon = 111320.0 * math.cos(math.radians(lat_mid))
+        map_width_m = (lon_max - lon_min) * meters_per_deg_lon
+        map_height_m = (lat_max - lat_min) * 111320.0
+
+        n_scanlines = max(2, int(map_height_m / self._grid_scan_spacing_m))
+        margin_m = map_width_m * 0.10
+        scan_width_m = map_width_m - 2 * margin_m
+        round_trip_time = 2 * scan_width_m / speed
+
+        raw_line = t / round_trip_time
+        line_idx = int(raw_line)
+        frac_in_line = raw_line - line_idx
+
+        line_mod = line_idx % (2 * n_scanlines)
+        if line_mod < n_scanlines:
+            actual_line = line_mod
+            going_north = True
+        else:
+            actual_line = 2 * n_scanlines - 1 - line_mod
+            going_north = False
+
+        frac_lat = actual_line / max(1, n_scanlines - 1)
+        current_lat = lat_min + frac_lat * (lat_max - lat_min)
+
+        if going_north:
+            current_lon_offset = margin_m + scan_width_m * (1.0 - frac_in_line)
+        else:
+            current_lon_offset = margin_m + scan_width_m * frac_in_line
+        current_lon_deg = lon_min + current_lon_offset / meters_per_deg_lon
+
+        lookahead_s = 2.0
+        ahead_frac = frac_in_line + lookahead_s / round_trip_time
+        if going_north:
+            ahead_lon_offset = margin_m + scan_width_m * max(0.0, 1.0 - ahead_frac)
+        else:
+            ahead_lon_offset = margin_m + scan_width_m * min(1.0, ahead_frac)
+        ahead_lon_deg = lon_min + ahead_lon_offset / meters_per_deg_lon
+
+        return clamp_to_safebox(current_lat, ahead_lon_deg)
+
+    def make_search_cmds(self, t: float) -> List[Command]:
+        """生成搜索命令列表：螺旋搜索 + 云台扫描。"""
+        slat, slon, pan, tilt = self._spiral(t)
+        return [
+            fly_to(slat, slon, speed=22.0),
+            point_gimbal(pan, tilt),
+            set_gimbal_fov(self._search_fov),
+        ]
+
+    def make_idle_cmds(self, center_lat: float, center_lon: float) -> List[Command]:
+        """全歼后的低功耗模式：低速大半径盘旋。"""
+        return [
+            fly_to(center_lat, center_lon, speed=18.0, loiter_radius=500.0),
+            point_gimbal(0.0, -45.0),
+            set_gimbal_fov(self._search_fov),
+        ]
+
+    def reset(self) -> None:
+        self._grid_scan_sector = (0, 0, 0, 0)
+        self._grid_scan_phase = 0.0
+        self._grid_scan_inited = False

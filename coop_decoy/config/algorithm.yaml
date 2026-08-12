@@ -1,12 +1,21 @@
 # 017 多无人机协同搜索跟踪算法配置（生产配置：扇区区域分配 + 诱饵分类器，
-# 诚实运动分类、无引擎上帝视角）。修改后重新运行 python -m examples.multi_uav_coop_decoy.run 即可生效。
-# cooperative_summon=true 可启用召唤汇聚/认领去重（K=2 协同实验，但诱饵干扰下评分更低）。
+# 诚实运动分类、无引擎上帝视角）。
 
-# 协同控制器（每架 UAV 一个实例，my_uid 由 run.py 注入）
-controller: search_track.coop_controller:CoopController
+# 协同控制器由 drone_agent.DroneAgent 实例化（my_uid 由平台注入），
+# 此处不再声明 controller 引用（原 search_track.coop_controller 模块不存在）。
 
 # 随机种子
 seed: null
+
+# === 感知配置 ===
+perception:
+  photo_mode: auto
+  accuracy: 0.85
+  noise_sigma_m: 50.0
+  yolo:
+    model_path: "weights/best.pt"
+    imgsz: 640
+    conf: 0.25
 
 # === 搜索参数（复用 016 FSM） ===
 mode: spiral

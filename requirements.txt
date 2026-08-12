@@ -12,3 +12,7 @@ pyyaml>=6.0
 
 # 数值计算
 numpy>=1.24.0
+
+# 自研 YOLO 目标识别（SDK 选择②：sensor() 返回自研 Detection）
+ultralytics>=8.0.0
+opencv-python>=4.8.0

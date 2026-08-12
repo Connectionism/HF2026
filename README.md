@@ -10,12 +10,12 @@
 
 ### 任务背景
 
-3架固定翼无人机分散部署至比赛区域，区域内存在3台真实移动目标、15台移动诱饵车。诱饵进入相机视场时按约50%概率被误识别为真目标。队伍需通过有限通信实现多机信息共享，协同区分诱饵与真实目标，完成目标清除与精准坐标上报。
+3架固定翼无人机分散部署至比赛区域，区域内存在3台真实移动目标、15台移动诱饵车。诱饵进入相机视场时按约50%概率被误识别为真目标。队伍需通过有限通信（≤50字节/条、≤4Hz、约1000m）实现多机信息共享，协同区分诱饵与真实目标，完成目标清除与精准坐标上报。
 
 ### 核心能力
 
 - **自主搜索**：3架UAV按扇区分工巡航，不重复、不扎堆
-- **目标识别**：通过多帧运动学一致性（EMA滤波 + 线性回归测速）区分真目标与诱饵
+- **目标识别**：自研 YOLO 检测（sensor 层选择②）+ 多帧运动学一致性（EMA滤波 + 线性回归测速）区分真目标与诱饵
 - **协同打击**：K=2协同盯防——2架UAV同时盯防同一真目标累计20秒即判定摧毁
 - **精准上报**：持续用 `report_target(lat, lon)` 上报判定为真目标的位置，按RMSE精度评分
 
@@ -33,33 +33,36 @@
 
 ```
 HF2026/
-├── src/                            # 源代码
-│   ├── __init__.py
-│   ├── communication/              # 通信模块 (成员1)
-│   │   ├── __init__.py
-│   │   ├── protocol.py             # 通信协议编解码 (T:/D:/A:/C:/R:)
-│   │   └── client.py               # Redis通信客户端封装
-│   ├── motion_control/             # 航迹控制模块 (成员2)
-│   │   ├── __init__.py
-│   │   ├── search.py               # 扇区搜索 + 螺旋扫描
-│   │   ├── tracker.py              # 跟踪loiter + LOS云台控制
-│   │   └── geo.py                  # 地理工具 (haversine/bearing/clamp)
-│   ├── cluster_scheduler/          # 集群调度模块 (成员3)
-│   │   ├── __init__.py
-│   │   ├── coordinator.py          # K=2协同分配 + 站位策略
-│   │   └── state_machine.py        # SEARCH→VERIFY→TRACK→RELEASE状态机
-│   ├── vision_detect/              # 视觉识别模块 (成员4)
-│   │   ├── __init__.py
-│   │   ├── ema_filter.py           # EMA滤波 + 速度回归
-│   │   ├── decoy_classifier.py     # 诱饵判别 (多特征融合)
-│   │   └── report.py               # report_target上报 + RMSE优化
-│   └── main.py                     # 主程序入口 (队长/成员5)
-├── config/                         # 配置文件
-│   └── algorithm.yaml              # 算法参数配置
-├── docs/                           # 文档
-│   └── INTERFACE.md                # 模块接口规范文档
-├── dataset/                        # 视觉采集样本 (仅本地, 打包时移除)
-├── sim_test_log/                   # 仿真测试日志
+├── coop_decoy/                     # 参赛智能体包（提交根目录）
+│   ├── drone_agent.py              # Agent 入口：DroneAgent（模块编排，不写业务算法）
+│   ├── manifest.json               # 智能体清单（agent_class: DroneAgent）
+│   ├── config/
+│   │   └── algorithm.yaml          # 算法参数配置（感知/搜索/协同/进阶）
+│   ├── weights/
+│   │   └── best.pt                 # 自研 YOLO 权重（sensor 层选择②）
+│   └── search_track/               # 四子模块（均通过 main.py 对外暴露）
+│       ├── communication/          # CommHandler：通信解析 + 指令构建（成员1）
+│       │   ├── main.py             #   └─ 对外入口（parse_inbox/build_broadcast/build_report）
+│       │   ├── client.py           #     CommClient（SDK broadcast/send_to 封装）
+│       │   ├── protocol.py         #     消息协议编解码（R:/T:/C:）
+│       │   └── config.py           #     通信配置
+│       ├── vision_detect/          # YOLO检测 + 坐标转换 + EMA + 诱饵判别（成员4）
+│       │   ├── main.py             #   └─ 对外入口（get_detect_result）
+│       │   ├── detect.py           #     YOLODetector（推理 + 像素→经纬度）
+│       │   ├── ema_filter.py       #     EMATracker（EMA滤波 + 线性回归测速）
+│       │   └── decoy_classifier.py #     DecoyClassifier（诱饵判别）
+│       ├── cluster_scheduler/      # K=2协同分配 + 状态机（成员3）
+│       │   ├── main.py             #   └─ 对外入口（CooperativeCoordinator + States）
+│       │   └── coordinator.py      #     协同目标分配、召唤/汇聚/盯防逻辑
+│       └── motion_control/         # 航迹规划 + 云台跟踪（成员2）
+│           ├── main.py             #   └─ 对外入口（SearchController/TrackController/geo_utils）
+│           ├── geo.py              #     hav/gis 工具（haversine/bearing/clamp/point_on_circle）
+│           ├── search.py           #     搜索航点生成（螺旋/扇区扫描）
+│           └── tracker.py          #     盘旋跟踪航点 + 云台LOS瞄准
+├── config/                         # 全局配置（预留）
+│   └── algorithm.yaml
+├── docs/
+│   └── INTERFACE.md                # 模块内部接口规范文档
 ├── install_offline/                # 离线安装
 │   ├── offline_requirements.txt    # 离线依赖清单
 │   └── wheels/                     # 离线whl依赖包
@@ -68,6 +71,7 @@ HF2026/
 │   └── pack_submission.py          # 提交包打包脚本
 ├── requirements.txt                # Python依赖
 ├── README.md                       # 项目说明
+├── SDK-API.md                      # 平台 SDK 接口参考（权威）
 └── .gitignore                      # Git忽略规则
 ```
 
@@ -79,8 +83,10 @@ HF2026/
 |------|------|
 | 操作系统 | Windows 10 1809+ / Windows 11 / Ubuntu 24.04 |
 | Python | 3.10+ |
-| 核心依赖 | redis, pyyaml, numpy |
-| 仿真平台 | 红枫2026赛事平台 (发行包自带Redis 7.4.2, Node.js v22) |
+| 核心依赖 | ultralytics, opencv-python, numpy, pyyaml |
+| 仿真平台 | 红枫2026赛事平台（`python -m competition ...`） |
+
+> 说明：`requirements.txt` 中 `redis>=4.5.0` 为历史遗留项，当前实现已改为平台 SDK 通信（`broadcast`/`send_to`/`report_target`），**无需 Redis**，可安全移除。
 
 ### 安装依赖
 
@@ -105,35 +111,38 @@ pip install --no-index --find-links=install_offline/wheels/ -r install_offline/o
 ### 方式1：赛事平台命令行运行（推荐）
 
 ```bash
-PYTHONPATH=. python -m competition run \
+python -m competition run \
   --scenario coop_decoy \
-  --agent src.main:HF2026Agent \
+  --agent coop_decoy.drone_agent:DroneAgent \
   --duration 600
 ```
 
 ### 方式2：赛事平台前端界面加载
 
-在前端算法输入框填写：`src/main.py:HF2026Agent`，点击「开始仿真」。
+在前端算法输入框填写：`coop_decoy.drone_agent:DroneAgent`，点击「开始仿真」。
 
-### 方式3：直接运行主程序（冒烟测试）
+### 方式3：通过 manifest 加载
 
-```bash
-python src/main.py
-```
+平台按 `coop_decoy/manifest.json`（`runner_module: drone_agent`、`agent_class: DroneAgent`）自动定位 Agent 入口，无需手动指定模块路径。
 
 ### 调试参数
 
 | 参数 | 说明 |
 |------|------|
+| `--mode train` | 选手本地开发（默认）：AccuracySimulator 模拟检出概率 0.85、噪声 50m |
+| `--mode eval` | 官方评测模式：YOLOv8 识别 UE 渲染图（选手本地一般用不到） |
+| `--accuracy <p>` | train 模式检出概率，默认 0.85，上限钳 0.9 |
+| `--noise-sigma <m>` | train 模式位置噪声标准差，默认 50，下限钳 30 |
 | `--seed N` | 固定随机种子，场景完全复现 |
 | `--visualize` | 开启浏览器可视化视图 |
-| `--dry-run` | 空转冒烟测试，不启动仿真引擎 |
+| `--photo-mode auto` | 相机帧拉取开关（auto/on/off） |
 | `--output DIR` | 自定义评分文件输出目录 |
 
 ### 批量评估
 
 ```bash
-python scripts/eval_runner.py --seeds 20 --scenario coop_decoy
+python scripts/eval_runner.py --seeds 20 --scenario coop_decoy \
+  --agent coop_decoy.drone_agent:DroneAgent
 ```
 
 ---
@@ -142,46 +151,57 @@ python scripts/eval_runner.py --seeds 20 --scenario coop_decoy
 
 | 角色 | 代号 | 核心模块 | 技术报告章节 |
 |------|------|----------|-------------|
-| **队长** | 成员5 | 统筹协调 + `main.py`主框架 + 集成调试 + 离线打包 | 系统总体架构、创新点、应用价值 |
-| **成员1** | 通信 | `src/communication/` 通信协议编解码 + 平台API封装 | 研究背景、通信方案 |
-| **成员2** | 控制 | `src/motion_control/` 航迹规划 + 云台跟踪 + 地理工具 | 航迹规划、云台跟踪控制 |
-| **成员3** | 调度 | `src/cluster_scheduler/` K=2协同分配 + 站位策略 + 状态机 | 多机协同调度（核心创新章节） |
-| **成员4** | 感知 | `src/vision_detect/` EMA滤波 + 诱饵判别 + 上报优化 | 视觉检测、诱饵判别 |
+| **队长** | 成员5 | 统筹协调 + `drone_agent.py`主框架 + 集成调试 + 离线打包 | 系统总体架构、创新点、应用价值 |
+| **成员1** | 通信 | `search_track/communication/` 协议编解码 + 平台SDK封装 | 研究背景、通信方案 |
+| **成员2** | 控制 | `search_track/motion_control/` 航迹规划 + 云台跟踪 + 地理工具 | 航迹规划、云台跟踪控制 |
+| **成员3** | 调度 | `search_track/cluster_scheduler/` K=2协同分配 + 状态机 | 多机协同调度（核心创新章节） |
+| **成员4** | 感知 | `search_track/vision_detect/` YOLO检测 + EMA滤波 + 诱饵判别 + 上报优化 | 视觉检测、诱饵判别 |
+
+### 数据流
+
+```
+obs.self.photo → vision_detect.get_detect_result()（YOLO推理 + 像素→经纬度）
+→ sensor() 返回 List[Detection] → SDK 注入 obs.self.detection
+→ vision_detect（EMATracker + DecoyClassifier）
+→ cluster_scheduler（CooperativeCoordinator，K=2 分配）
+→ motion_control（SearchController + TrackController）
+→ communication.build_broadcast() / build_report()
+```
 
 ### 各模块职责
 
-#### 通信模块 (`src/communication/`) — 成员1
+#### 智能体入口 (`drone_agent.py`) — 队长
 
-- `protocol.py`：五类消息编解码
-  - `T:lat,lon` 确认真目标位置共享
-  - `D:lat,lon` 确认诱饵位置共享
-  - `A:tgtidx,rank` 目标认领声明
-  - `C:tgtidx` 目标已摧毁通知
-  - `R:lat,lon` 召唤队友汇聚
-- `client.py`：Redis通信客户端封装（字节限制、频率限制、收件箱管理）
+- `DroneAgent(CoopAgent)`：继承赛题二专用基类 `competition.sdk.scenarios.coop_decoy.CoopAgent`，实现 `sensor()`/`decide()` 生命周期
+- 只做模块编排，业务算法全部下沉至 `search_track/` 四子模块
+- 从 `coop_decoy/config/algorithm.yaml` 加载参数
 
-#### 航迹控制模块 (`src/motion_control/`) — 成员2
+#### 通信模块 (`search_track/communication/`) — 成员1
 
-- `geo.py`：地理工具（haversine距离、bearing方位角、边界裁剪）— **全员依赖，最先完成**
-- `search.py`：扇区搜索——3架UAV均分360°，各自扇区内螺旋扩张扫描
-- `tracker.py`：跟踪loiter——K=2站位盘旋，云台LOS瞄准，间距>200m
+- `main.py` 暴露 `CommHandler`：解析 `obs.comm_inbox` + 构建指令
+- 消息协议（`protocol.py`）：
+  - `R:lat,lon,uid` 发现真目标广播（召唤汇聚）
+  - `T:lat,lon,dwell` 本机盯防状态广播
+  - `C:lat,lon` 目标已摧毁广播
+- 底层基于平台 SDK `broadcast`/`report_target` 命令构造器，非 Redis
 
-#### 集群调度模块 (`src/cluster_scheduler/`) — 成员3
+#### 航迹控制模块 (`search_track/motion_control/`) — 成员2
 
-- `coordinator.py`：K=2协同分配——召唤→汇聚→同时盯防→摧毁→释放→轮转
-- `state_machine.py`：状态机 SEARCH→VERIFY→TRACK→RELEASE
+- `geo.py`：地理工具（haversine距离、bearing方位角、边界裁剪、圆上取点）— **全员依赖，最先完成**
+- `search.py`：搜索航点生成——螺旋搜索 / 扇区扩张扫描（3架UAV均分扇区）
+- `tracker.py`：跟踪loiter——K=2站位盘旋，云台LOS瞄准
 
-#### 视觉识别模块 (`src/vision_detect/`) — 成员4
+#### 集群调度模块 (`search_track/cluster_scheduler/`) — 成员3
 
-- `ema_filter.py`：EMA滤波 + 线性回归速度估计
-- `decoy_classifier.py`：多特征融合诱饵判别（速度+加速度方差+方向一致性+位移跨度）
-- `report.py`：report_target上报优化（只报告EMA平滑后位置，降低RMSE）
+- `coordinator.py`：`CooperativeCoordinator` K=2协同分配——召唤→汇聚→同时盯防→摧毁→释放→轮转
+- 状态机：`States` 常量 SEARCH→VERIFY→TRACK 流转（相关逻辑已并入 coordinator）
 
-#### 主程序 (`src/main.py`) — 队长
+#### 视觉识别模块 (`search_track/vision_detect/`) — 成员4
 
-- Agent主类定义，实现 `decide(obs, dt)` 主循环
-- 调用各子模块、组装控制指令列表
-- 从 `config/algorithm.yaml` 加载参数
+- `detect.py`：`YOLODetector` 推理（sensor 层选择②自研识别）+ 像素→经纬度坐标转换
+- `ema_filter.py`：`EMATracker` EMA滤波 + 线性回归速度估计
+- `decoy_classifier.py`：`DecoyClassifier` 多特征融合诱饵判别（速度+方向一致性+位移跨度）
+- `report.py` 逻辑并入 `drone_agent`：report_target上报优化（只报告EMA平滑后位置，降低RMSE）
 
 ---
 
@@ -203,7 +223,8 @@ python scripts/eval_runner.py --seeds 20 --scenario coop_decoy
 ## 七、开发规范
 
 - **代码统一使用相对路径**，禁止写死个人绝对路径
-- **启动命令固定**：`python src/main.py`
+- **Agent 入口固定**：`coop_decoy.drone_agent:DroneAgent`（对应 `manifest.json` 中 `runner_module: drone_agent` + `agent_class: DroneAgent`）
+- **子模块仅通过各 `search_track/*/main.py` 对外暴露**，禁止跨模块直接访问底层文件
 - **Git工作流**：main（稳定版）← develop（集成分支）← feature/*（各成员分支）
-- **接口契约**：参见 `docs/INTERFACE.md`，变更需队长审批
+- **接口契约**：SDK 见 `SDK-API.md`（权威），模块内部接口见 `docs/INTERFACE.md`，变更需队长审批
 - **文件编码**：UTF-8

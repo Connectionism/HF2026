@@ -1,70 +1,33 @@
-"""视觉检测模块统一入口 —— VisionDetect 类。
-
-对外固定接口：
-    VisionDetect.detect(obs) -> List[dict]
-    VisionDetect.reset()     -> None
-
-内部封装：
-    DecoyClassifier —— EMA 滤波 + 运动模式诱饵判别
-    ReportOptimizer —— 上报时机/频率优化（可选使用）
 """
-from __future__ import annotations
+vision_detect 模块对外统一入口
 
-from typing import Any, Dict, List
+对外暴露:
+    EMATracker          — EMA 目标跟踪器（含速度方差、位移、方向变化方差等运动特征）
+    DecoyClassifier     — 多特征投票诱饵判别器
+    YOLODetector        — YOLO 推理器（目标检测 + 像素→经纬度坐标转换 + 超时降级）
+    get_detect_result   — 视觉检测统一入口（供 drone_agent.sensor() 调用，返回 List[Detection]）
+    DetBox              — 像素检测框数据结构（类别 / 置信度 / 像素 bbox）
 
+内部实现:
+    ema_filter.py        — EMATracker 类
+    decoy_classifier.py  — DecoyClassifier 类
+    detect.py            — YOLODetector / get_detect_result / DetBox
+
+数据流:
+    photo(bytes) / 相机帧(numpy HxWx3)
+    → detect.get_detect_result(): YOLO 推理 → 像素框 → pan_tilt_to_latlon 坐标转换
+    → List[Detection]（sensor() 返回给 SDK，list[0] 注入 obs.self.detection）
+    → decide() 中: raw detection(lat,lon) → EMATracker.append() → DecoyClassifier.update()
+"""
+
+from .ema_filter import EMATracker
 from .decoy_classifier import DecoyClassifier
-from .report import ReportOptimizer
+from .detect import YOLODetector, DetBox, get_detect_result
 
-
-class VisionDetect:
-    """视觉检测模块：从 obs 中提取平台检测结果并做真伪判别。
-
-    detect(obs) 返回目标列表，每项为 dict：
-        {"lat": float, "lon": float, "confidence": float, "is_real": bool}
-    本帧无检测时返回空列表。
-    """
-
-    def __init__(self) -> None:
-        self._classifier = DecoyClassifier()
-        self._report_optimizer = ReportOptimizer()
-        self._tick: int = 0
-
-    def detect(self, obs: Any) -> List[Dict[str, Any]]:
-        """从 obs.self.detection 提取本帧检测，做 EMA 滤波 + 诱饵判别。
-
-        Args:
-            obs: 平台注入的观测对象（含 self.detection）。
-
-        Returns:
-            list[dict]: 标准化目标列表；无检测时为空列表。
-        """
-        self._tick += 1
-        results: List[Dict[str, Any]] = []
-
-        self_view = getattr(obs, "self", None)
-        det = getattr(self_view, "detection", None)
-        if det is None or not getattr(det, "detected", False):
-            return results
-
-        lat = getattr(det, "target_lat", None)
-        lon = getattr(det, "target_lon", None)
-        if lat is None or lon is None:
-            return results
-
-        # EMA 滤波 + 运动模式诱饵判别
-        self._classifier.update(lat, lon, dt=0.1)
-        smoothed = self._classifier.get_report_position() or (lat, lon)
-
-        results.append({
-            "lat": smoothed[0],
-            "lon": smoothed[1],
-            "confidence": self._classifier.confidence,
-            "is_real": self._classifier.is_real_target,
-        })
-        return results
-
-    def reset(self) -> None:
-        """每局开始前清零全部内部状态。"""
-        self._classifier.reset()
-        self._report_optimizer.reset()
-        self._tick = 0
+__all__ = [
+    "EMATracker",
+    "DecoyClassifier",
+    "YOLODetector",
+    "DetBox",
+    "get_detect_result",
+]
