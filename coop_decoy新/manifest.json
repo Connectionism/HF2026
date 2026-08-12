@@ -1,7 +1,7 @@
 {
   "id": "multi_uav_coop_decoy",
-  "name": "赛题二：多目标协同搜索｜阶段2三机协同",
-  "description": "阶段2：三机分区搜索 + R:/T:/C:通信协议 + K=2协同摧毁 + 槽位安全避让 + 多特征投票诱饵判别",
+  "name": "赛题二：多目标协同搜索｜队伍名‑阶段1单机基线",
+  "description": "阶段1：单机调试，drone0执行业务，其余无人机悬停",
   "scenario": "config/scenario.json",
   "runner_module": "drone_agent",
   "default_duration": 600.0
